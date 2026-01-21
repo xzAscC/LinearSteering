@@ -5,10 +5,10 @@ import numpy as np
 
 MODEL_LAYERS = {
     "Qwen/Qwen3-1.7B": 28,
-    # "Qwen/Qwen3-14B": 40,
-    # "meta-llama/Llama-3.1-8B-Instruct": 32,
-    # "google/gemma-2-2b": 26,
-    # "allenai/Olmo-3-1025-7B": 32,
+    "Qwen/Qwen3-14B": 40,
+    "meta-llama/Llama-3.1-8B-Instruct": 32,
+    "google/gemma-2-2b": 26,
+    "allenai/Olmo-3-1025-7B": 32,
 }
 
 CONCEPT_CATEGORIES = {
