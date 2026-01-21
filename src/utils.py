@@ -4,45 +4,37 @@ import hashlib
 import numpy as np
 
 MODEL_LAYERS = {
-    # "EleutherAI/pythia-70m": 6,
-    # "EleutherAI/pythia-160m": 12,
-    "google/gemma-2-2b": 26,
-    # # "google/gemma-2-9b": 42,
     "Qwen/Qwen3-1.7B": 28,
     # "Qwen/Qwen3-14B": 40,
+    # "meta-llama/Llama-3.1-8B-Instruct": 32,
+    # "google/gemma-2-2b": 26,
+    # "allenai/Olmo-3-1025-7B": 32,
 }
 
 CONCEPT_CATEGORIES = {
-    "sycophantic": {
-        "base_path": "dataset/sycophantic.json",
-        "dataset_key": "instruction",
-        "loader_type": "single_file_with_pos_neg",
-        "instruction_key": "instruction",
-    },
-    "evil": {
-        "base_path": "dataset/evil.json",
-        "dataset_key": "instruction",
-        "loader_type": "single_file_with_pos_neg",
-        "instruction_key": "instruction",
-    },
-    "optimistic": {
-        "base_path": "dataset/optimistic.json",
-        "dataset_key": "instruction",
-        "loader_type": "single_file_with_pos_neg",
-        "instruction_key": "instruction",
-    },
-    "language_en_fr_paired": {
-        "base_path": "dataset/en_fr.json",
-        "dataset_key": "instruction",
-        "loader_type": "single_file_with_pos_neg",
-        "instruction_key": "instruction",
-    },
-    "refusal": {
-        "base_path": "dataset/refusal.json",
-        "dataset_key": "instruction",
-        "loader_type": "single_file_with_pos_neg",
-        "instruction_key": "instruction",
-    },
+    f"steering_{subtype.replace(':', '_')}": {
+        "base_path": "dataset/steering_tasks.jsonl",
+        "dataset_key": "prompt",
+        "loader_type": "jsonl",
+        "sub_type": subtype,
+    }
+    for subtype in [
+        "change_case:capital_word_frequency",
+        "change_case:english_capital",
+        "change_case:english_lowercase",
+        "detectable_format:constrained_response",
+        "detectable_format:json_format",
+        "detectable_format:multiple_sections",
+        "detectable_format:number_bullet_lists",
+        "detectable_format:number_highlighted_sections",
+        "detectable_format:title",
+        "exclude",
+        "include",
+        "language:response_language",
+        "punctuation:no_comma",
+        "startend:end_checker",
+        "startend:quotation",
+    ]
 }
 
 
@@ -314,5 +306,3 @@ def hidden_to_flat(h: torch.Tensor, target_dtype=torch.bfloat16) -> torch.Tensor
     """
     hs_dim = h.shape[-1]
     return h.reshape(-1, hs_dim).to(target_dtype)
-
-
