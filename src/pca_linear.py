@@ -380,7 +380,7 @@ def main():
     )
     # Trajectory sweep parameters
     parser.add_argument("--alpha_min", type=float, default=1)
-    parser.add_argument("--alpha_max", type=float, default=1e6)
+    parser.add_argument("--alpha_max", type=float, default=1e5)
     parser.add_argument("--alpha_points", type=int, default=200) # Fewer points than smoothness
     
     parser.add_argument(

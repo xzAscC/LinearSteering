@@ -2,8 +2,6 @@
 set -euo pipefail
 
 # Define models
-# models=("Qwen/Qwen3-14B" "meta-llama/Llama-3.1-8B-Instruct" "allenai/Olmo-3-1025-7B")
-
 models=("Qwen/Qwen3-1.7B" "google/gemma-2-2b")
 
 # Layers: 10 evenly spaced layers from 0-100

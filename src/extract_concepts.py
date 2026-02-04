@@ -87,11 +87,11 @@ def _load_jsonl_dataset(
             if not line.strip():
                 continue
             item = json.loads(line)
-            
+
             # Filter by subtype if specified
             if filter_subtype is not None and item.get("sub_type") != filter_subtype:
                 continue
-                
+
             if "pos" in item and "neg" in item:
                 positive_prompts.append(item["pos"])
                 negative_prompts.append(item["neg"])
@@ -191,7 +191,9 @@ class DifferenceInMeans:
         """
         model_dimension = self.model.cfg.d_model
         layer_length = len(self.layers)
-        logger.info(f"Computing vectors for {layer_length} layers, dim {model_dimension}")
+        logger.info(
+            f"Computing vectors for {layer_length} layers, dim {model_dimension}"
+        )
 
         positive_concept_vector = torch.zeros(
             layer_length, model_dimension, device=self.device, dtype=self.dtype
@@ -205,14 +207,16 @@ class DifferenceInMeans:
 
         # Process Positive Dataset
         positive_dataset_size = min(len(self.positive_dataset), self.max_dataset_size)
-        logger.info(f"Processing positive dataset ({positive_dataset_size} examples)...")
+        logger.info(
+            f"Processing positive dataset ({positive_dataset_size} examples)..."
+        )
 
         for i, example in tqdm(
             enumerate(self.positive_dataset), total=positive_dataset_size
         ):
             if i >= self.max_dataset_size:
                 break
-            
+
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -224,7 +228,7 @@ class DifferenceInMeans:
                 positive_hidden_state = positive_cache[
                     f"blocks.{layer_idx}.hook_resid_post"
                 ].reshape(-1, model_dimension)
-                
+
                 # Sum over sequence length
                 positive_concept_vector[layer_idx] += positive_hidden_state.sum(dim=0)
 
@@ -234,7 +238,9 @@ class DifferenceInMeans:
 
         # Process Negative Dataset
         negative_dataset_size = min(len(self.negative_dataset), self.max_dataset_size)
-        logger.info(f"Processing negative dataset ({negative_dataset_size} examples)...")
+        logger.info(
+            f"Processing negative dataset ({negative_dataset_size} examples)..."
+        )
 
         for i, example in tqdm(
             enumerate(self.negative_dataset), total=negative_dataset_size
@@ -247,7 +253,7 @@ class DifferenceInMeans:
 
             context = example[self.dataset_key]
             # We need to run up to the max layer we are interested in.
-            # stop_at_layer is 1-indexed for 'blocks.{i}'? 
+            # stop_at_layer is 1-indexed for 'blocks.{i}'?
             # run_with_cache(stop_at_layer=L) returns cache for layers 0..L-1
             # But the loop iterates 'self.layers', which is range(layer).
             # The max index in self.layers is layer-1.
@@ -256,7 +262,7 @@ class DifferenceInMeans:
             # Ah, wait, original code: `for layer in self.layers` ...
             # Inside the second loop (negative), it had a `layer` variable collision?
             # "blocks.{layer}.hook_resid_post".
-            # The `stop_at_layer` in original code used `layer + 1`. 
+            # The `stop_at_layer` in original code used `layer + 1`.
             # If `layer` comes from `range(layer)` (the argument), then `layer` is an int.
             # But the original code had `for (concept_category_name...)` -> `concept_vector(...)` -> `get_concept_vectors(...)`
             # Inside `DifferenceInMeans`: `self.layers = list(range(layer))`
@@ -273,19 +279,20 @@ class DifferenceInMeans:
             # Actually, if we want cache for all layers 0..N, we need stop_at_layer=N+1?
             # If `self.layers` is `range(layer_arg)`, then max val is layer_arg-1.
             # We probably want to run up to `len(self.layers)` or `self.layers[-1] + 1`.
-            
-            # Let's fix this properly. 
+
+            # Let's fix this properly.
             max_layer_idx = self.layers[-1]
-            
+
             _, negative_cache = self.model.run_with_cache(
-                context, stop_at_layer=max_layer_idx + 2 # Safety, ensures we get the block.
+                context,
+                stop_at_layer=max_layer_idx + 2,  # Safety, ensures we get the block.
             )
 
             for layer_idx in self.layers:
                 negative_hidden_state = negative_cache[
                     f"blocks.{layer_idx}.hook_resid_post"
                 ].reshape(-1, model_dimension)
-                
+
                 negative_concept_vector[layer_idx] += negative_hidden_state.sum(dim=0)
 
                 if layer_idx == 0:
@@ -313,7 +320,7 @@ class DifferenceInMeans:
                 json.dump(norm.tolist(), f)
         logger.info(f"Concept diff norm: {norm}")
         logger.info(f"Concept vector shape: {concept_diff.shape}")
-        
+
         return concept_diff
 
 
@@ -410,14 +417,13 @@ def obtain_concept_vector(
         max_dataset_size=max_dataset_size,
     )
 
-
     # Generate and save 3 random directions
     logger.info("Generating and saving 3 random directions...")
     for i in range(15):
         random_direction = torch.randn_like(concept_vector)
         random_direction = torch.nn.functional.normalize(random_direction, dim=1)
         # Use a generic name within the model folder
-        random_save_path = os.path.join(save_dir, f"random_direction_{i+1}.pt")
+        random_save_path = os.path.join(save_dir, f"random_direction_{i + 1}.pt")
         torch.save(random_direction, random_save_path)
 
     torch.cuda.empty_cache()
@@ -433,7 +439,7 @@ def concept_vector(
     max_dataset_size: int = 300,
 ) -> None:
     """Main function to obtain concept vectors.
-    
+
     Args:
         model_name: The model name (if None, process all models).
         concept_category: The concept category (if None, process all).
@@ -444,15 +450,15 @@ def concept_vector(
     os.makedirs("assets/concept_vectors", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     logger.add("logs/concept_vectors.log")
-    
+
     device = "cuda"
     dtype = torch.bfloat16
 
     # Determine which models and concepts to process
     models_to_process = (
-        [(model_name, MODEL_LAYERS[model_name])]
+        [model_name]
         if model_name and model_name in MODEL_LAYERS
-        else list(MODEL_LAYERS.items())
+        else list(MODEL_LAYERS.keys())
     )
 
     concepts_to_process = (
@@ -461,9 +467,9 @@ def concept_vector(
         else list(CONCEPT_CATEGORIES.items())
     )
 
-    for model_name_iter, max_layers in models_to_process:
+    for model_name_iter in models_to_process:
         logger.info(f"Processing model: {model_name_iter}")
-        
+
         try:
             model = transformer_lens.HookedTransformer.from_pretrained(
                 model_name_iter, device=device, dtype=dtype, trust_remote_code=True
@@ -471,6 +477,8 @@ def concept_vector(
         except Exception as e:
             logger.error(f"Failed to load model {model_name_iter}: {e}")
             continue
+
+        max_layers = model.cfg.n_layers
 
         for concept_category_name, concept_category_config in concepts_to_process:
             logger.info(f"Processing concept: {concept_category_name}")
@@ -485,8 +493,10 @@ def concept_vector(
                     method,
                 )
             except Exception as e:
-                logger.error(f"Error processing concept {concept_category_name} for model {model_name_iter}: {e}")
-                
+                logger.error(
+                    f"Error processing concept {concept_category_name} for model {model_name_iter}: {e}"
+                )
+
         del model
         torch.cuda.empty_cache()
         gc.collect()

@@ -8,7 +8,7 @@ MODEL_LAYERS = {
     "Qwen/Qwen3-14B": 40,
     "meta-llama/Llama-3.1-8B-Instruct": 32,
     "google/gemma-2-2b": 26,
-    "allenai/Olmo-3-1025-7B": 32,
+    "google/gemma-2-9b": 42,
 }
 
 CONCEPT_CATEGORIES = {
@@ -36,7 +36,6 @@ CONCEPT_CATEGORIES = {
         "startend:quotation",
     ]
 }
-
 
 def set_seed(seed: int) -> None:
     """

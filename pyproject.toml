@@ -9,4 +9,6 @@ dependencies = [
     "loguru>=0.7.3",
     "torch>=2.9.1",
     "transformer-lens>=2.16.1",
+    "matplotlib>=3.10.0",
+    "ipykernel>=7.1.0",
 ]
