@@ -1,22 +1,22 @@
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import torch
 import transformers
 from loguru import logger
 
-from extract_concepts import load_concept_datasets
 from utils import (
     MODEL_LAYERS,
     CONCEPT_CATEGORIES,
     get_model_name_for_path,
-    parse_layers_to_run,
     seed_from_name,
     set_seed,
     _get_layers_container,
+    load_concept_datasets,
+    make_steering_hook,
 )
 
 
@@ -58,16 +58,11 @@ def run_model_capture_layers(
 
         return _hook
 
-    def _steer_hook(_module, _inputs, output):
-        if isinstance(output, tuple):
-            hidden = output[0]
-            vec = steering_vector.to(device=hidden.device, dtype=hidden.dtype)
-            hidden = hidden + (alpha * vec)
-            return (hidden,) + output[1:]
-        vec = steering_vector.to(device=output.device, dtype=output.dtype)
-        return output + (alpha * vec)
-
-    handles.append(layers_container[steer_layer].register_forward_hook(_steer_hook))
+    handles.append(
+        layers_container[steer_layer].register_forward_hook(
+            make_steering_hook(steering_vector, alpha, device=device)
+        )
+    )
     for layer_idx in probe_layers:
         handles.append(
             layers_container[layer_idx].register_forward_hook(
@@ -145,22 +140,12 @@ def alpha_to_slug(alpha: float) -> str:
     return alpha_str.replace("-", "m").replace(".", "p")
 
 
-def compute_cos_sim(
-    probe_weight: torch.Tensor, steering_vector: torch.Tensor
-) -> Optional[float]:
-    if probe_weight.numel() != steering_vector.numel():
-        return None
-    probe_vec = probe_weight.float()
-    steer_vec = steering_vector.float()
-    cos_sim = torch.nn.functional.cosine_similarity(probe_vec, steer_vec, dim=0)
-    return float(cos_sim.item())
-
-
-def plot_cosine_similarity(
+def plot_probe_accuracy(
     results: Dict[str, Dict[str, Dict[str, float]]],
     probe_layers: List[int],
     vector_name: str,
     output_dir: str,
+    steer_layer: int,
 ) -> None:
     if not results:
         return
@@ -173,28 +158,31 @@ def plot_cosine_similarity(
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
 
     for alpha_key in alpha_keys:
-        cos_vals = []
+        acc_vals = []
         for layer_idx in probe_layers:
             layer_stats = results.get(alpha_key, {}).get(str(layer_idx), {})
-            cos_vals.append(layer_stats.get("cos_sim", float("nan")))
+            acc_vals.append(layer_stats.get("test_acc", float("nan")))
         ax.plot(
             probe_layers,
-            cos_vals,
+            acc_vals,
             marker="o",
             linewidth=1.6,
             markersize=4,
             label=f"alpha={alpha_key}",
         )
 
-    ax.axhline(0.0, color="#444444", linestyle="--", linewidth=1, alpha=0.7)
     ax.set_xlabel("Probe layer")
-    ax.set_ylabel("Cosine similarity")
-    ax.set_title(f"Probe vs Steering Cosine ({vector_name})", fontweight="bold")
-    ax.set_ylim(-1.0, 1.0)
+    ax.set_ylabel("Probe accuracy")
+    ax.set_title(
+        f"Probe Accuracy ({vector_name}) steer={steer_layer}", fontweight="bold"
+    )
+    ax.set_ylim(0.0, 1.0)
     ax.legend(frameon=False, ncol=2)
 
     os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, f"cos_sim_{vector_name}.png")
+    save_path = os.path.join(
+        output_dir, f"probe_acc_{vector_name}_steer_{steer_layer}.png"
+    )
     fig.tight_layout()
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     fig.savefig(save_path.replace(".png", ".pdf"), bbox_inches="tight")
@@ -208,6 +196,44 @@ def load_vector(path: str) -> torch.Tensor:
     if isinstance(vector, dict):
         vector = vector.get("random_vector", vector)
     return vector
+
+
+def _pick_segment_layers(start: int, end: int, count: int) -> List[int]:
+    if start > end or count <= 0:
+        return []
+    length = end - start + 1
+    if length <= 1:
+        return [start]
+    if count == 1:
+        return [start + length // 2]
+    indices = []
+    for i in range(count):
+        pos = start + round(i * (length - 1) / (count - 1))
+        indices.append(int(min(end, max(start, pos))))
+    return sorted(set(indices))
+
+
+def select_steer_layers(max_layers: int, total_layers: int = 6) -> List[int]:
+    if max_layers <= 1:
+        return [0]
+    last_valid = max_layers - 2
+    if last_valid <= 0:
+        return [0]
+    per_segment = max(1, total_layers // 3)
+    early_end = last_valid // 3
+    mid_end = (2 * last_valid) // 3
+    segments = [
+        (0, early_end),
+        (early_end + 1, mid_end),
+        (mid_end + 1, last_valid),
+    ]
+    selected: List[int] = []
+    for start, end in segments:
+        selected.extend(_pick_segment_layers(start, end, per_segment))
+    selected = sorted(set([l for l in selected if 0 <= l <= last_valid]))
+    if len(selected) > total_layers:
+        selected = selected[:total_layers]
+    return selected
 
 
 def main() -> None:
@@ -228,8 +254,6 @@ def main() -> None:
         type=str,
         default="random_direction_1,random_direction_2,random_direction_3",
     )
-    parser.add_argument("--steer_layer", type=int, default=6)
-    parser.add_argument("--probe_layers", type=str, default="6,13,20,27")
     parser.add_argument("--alpha_values", type=str, default="1, 10,100,1000,10000")
     parser.add_argument("--max_prompts", type=int, default=8196)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -261,20 +285,12 @@ def main() -> None:
 
     for model_name_full in model_names:
         max_layers = MODEL_LAYERS[model_name_full]
-        probe_layers = parse_layers_to_run(
-            args.probe_layers, max_layers, is_percentage=False
-        )
-        if args.steer_layer < 0 or args.steer_layer >= max_layers:
-            raise ValueError(
-                "Invalid steer_layer "
-                f"{args.steer_layer} for model with {max_layers} layers"
-            )
-        if not probe_layers:
-            raise ValueError("No valid probe layers")
+        steer_layers = select_steer_layers(max_layers, total_layers=6)
+        if not steer_layers:
+            raise ValueError("No valid steer layers selected")
 
         logger.info(f"Model: {model_name_full}")
-        logger.info(f"Steer layer: {args.steer_layer}")
-        logger.info(f"Probe layers: {probe_layers}")
+        logger.info(f"Steer layers: {steer_layers}")
         logger.info(f"Alpha values: {alpha_values}")
 
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -313,141 +329,150 @@ def main() -> None:
         for vector_name, vector_path in vector_specs:
             logger.info(f"Processing vector: {vector_name}")
             vector_tensor = load_vector(vector_path)
-            if vector_tensor.ndim == 1:
-                steering_vector = vector_tensor
-            else:
-                steering_vector = vector_tensor[args.steer_layer]
+            results: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
-            results: Dict[str, Dict[str, Dict[str, float]]] = {}
-
-            for alpha in alpha_values:
-                logger.info(f"Alpha: {alpha}")
-                layer_features_before: Dict[int, List[torch.Tensor]] = {
-                    l: [] for l in probe_layers
-                }
-                layer_features_after: Dict[int, List[torch.Tensor]] = {
-                    l: [] for l in probe_layers
-                }
-
-                for i in range(0, len(prompts), args.batch_size):
-                    batch_prompts = prompts[i : i + args.batch_size]
-                    inputs = tokenizer(
-                        batch_prompts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                    ).to(device)
-
-                    captured_before = run_model_capture_layers(
-                        model,
-                        inputs.input_ids,
-                        steering_vector,
-                        args.steer_layer,
-                        0.0,
-                        probe_layers,
-                        device,
+            for steer_layer in steer_layers:
+                probe_layers = [
+                    layer
+                    for layer in (steer_layer, steer_layer + 1, steer_layer + 2)
+                    if layer <= max_layers - 2
+                ]
+                if not probe_layers:
+                    logger.warning(
+                        f"Skipping steer layer {steer_layer}: no probe layers"
                     )
-                    captured_after = run_model_capture_layers(
-                        model,
-                        inputs.input_ids,
-                        steering_vector,
-                        args.steer_layer,
-                        alpha,
-                        probe_layers,
-                        device,
-                    )
+                    continue
+                logger.info(
+                    f"Steer layer: {steer_layer} | Probe layers: {probe_layers}"
+                )
 
+                if vector_tensor.ndim == 1:
+                    steering_vector = vector_tensor
+                else:
+                    steering_vector = vector_tensor[steer_layer]
+
+                alpha_results: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+                for alpha in alpha_values:
+                    logger.info(f"Alpha: {alpha}")
+                    layer_features_before: Dict[int, List[torch.Tensor]] = {
+                        l: [] for l in probe_layers
+                    }
+                    layer_features_after: Dict[int, List[torch.Tensor]] = {
+                        l: [] for l in probe_layers
+                    }
+
+                    for i in range(0, len(prompts), args.batch_size):
+                        batch_prompts = prompts[i : i + args.batch_size]
+                        inputs = tokenizer(
+                            batch_prompts,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                        ).to(device)
+
+                        captured_before = run_model_capture_layers(
+                            model,
+                            inputs.input_ids,
+                            steering_vector,
+                            steer_layer,
+                            0.0,
+                            probe_layers,
+                            device,
+                        )
+                        captured_after = run_model_capture_layers(
+                            model,
+                            inputs.input_ids,
+                            steering_vector,
+                            steer_layer,
+                            alpha,
+                            probe_layers,
+                            device,
+                        )
+
+                        for layer_idx in probe_layers:
+                            h_before = captured_before[layer_idx]
+                            h_after = captured_after[layer_idx]
+                            pooled_before = h_before.mean(dim=1).float().cpu()
+                            pooled_after = h_after.mean(dim=1).float().cpu()
+                            layer_features_before[layer_idx].append(pooled_before)
+                            layer_features_after[layer_idx].append(pooled_after)
+
+                    alpha_key = str(alpha)
+                    alpha_results[alpha_key] = {}
                     for layer_idx in probe_layers:
-                        h_before = captured_before[layer_idx]
-                        h_after = captured_after[layer_idx]
-                        pooled_before = h_before.mean(dim=1).float().cpu()
-                        pooled_after = h_after.mean(dim=1).float().cpu()
-                        layer_features_before[layer_idx].append(pooled_before)
-                        layer_features_after[layer_idx].append(pooled_after)
-
-                alpha_key = str(alpha)
-                results[alpha_key] = {}
-                for layer_idx in probe_layers:
-                    X_before = torch.cat(layer_features_before[layer_idx], dim=0)
-                    X_after = torch.cat(layer_features_after[layer_idx], dim=0)
-                    X = torch.cat([X_before, X_after], dim=0)
-                    y = torch.cat(
-                        [
-                            torch.zeros(X_before.shape[0]),
-                            torch.ones(X_after.shape[0]),
-                        ],
-                        dim=0,
-                    )
-                    probe_seed = seed_from_name(f"{vector_name}-{alpha}-{layer_idx}")
-                    stats, weight, bias, mean, std = train_eval_linear_probe(
-                        X,
-                        y,
-                        seed=probe_seed,
-                        epochs=args.epochs,
-                        lr=args.lr,
-                        test_ratio=args.test_ratio,
-                    )
-                    std = std.clamp_min(1e-6)
-                    raw_weight = weight / std
-                    if vector_tensor.ndim == 1:
-                        steer_vec = vector_tensor.detach().cpu()
-                    else:
-                        steer_vec = vector_tensor[layer_idx].detach().cpu()
-                    cos_sim = compute_cos_sim(raw_weight, steer_vec)
-                    if cos_sim is None:
-                        logger.warning(
-                            "Cosine similarity skipped due to shape mismatch: "
-                            f"probe {raw_weight.numel()} vs steer {steer_vec.numel()}"
+                        X_before = torch.cat(layer_features_before[layer_idx], dim=0)
+                        X_after = torch.cat(layer_features_after[layer_idx], dim=0)
+                        X = torch.cat([X_before, X_after], dim=0)
+                        y = torch.cat(
+                            [
+                                torch.zeros(X_before.shape[0]),
+                                torch.ones(X_after.shape[0]),
+                            ],
+                            dim=0,
                         )
-                    else:
-                        logger.info(
-                            "Cosine similarity: "
-                            f"vector={vector_name} alpha={alpha} layer={layer_idx} "
-                            f"cos={cos_sim:.4f}"
+                        probe_seed = seed_from_name(
+                            f"{vector_name}-{steer_layer}-{alpha}-{layer_idx}"
+                        )
+                        stats, weight, bias, mean, std = train_eval_linear_probe(
+                            X,
+                            y,
+                            seed=probe_seed,
+                            epochs=args.epochs,
+                            lr=args.lr,
+                            test_ratio=args.test_ratio,
+                        )
+                        std = std.clamp_min(1e-6)
+                        raw_weight = weight / std
+
+                        weight_dir = os.path.join(
+                            output_dir,
+                            "probe_weights",
+                            vector_name,
+                            f"steer_{steer_layer}",
+                            f"alpha_{alpha_to_slug(alpha)}",
+                        )
+                        os.makedirs(weight_dir, exist_ok=True)
+                        weight_path = os.path.join(weight_dir, f"layer_{layer_idx}.pt")
+                        torch.save(
+                            {
+                                "weight": weight,
+                                "bias": bias,
+                                "mean": mean,
+                                "std": std,
+                                "raw_weight": raw_weight,
+                                "vector": vector_name,
+                                "alpha": alpha,
+                                "steer_layer": steer_layer,
+                                "layer": layer_idx,
+                                "model": model_name_full,
+                            },
+                            weight_path,
                         )
 
-                    weight_dir = os.path.join(
-                        output_dir,
-                        "probe_weights",
+                        stats["weight_path"] = weight_path
+                        alpha_results[alpha_key][str(layer_idx)] = stats
+
+                    plot_probe_accuracy(
+                        alpha_results,
+                        probe_layers,
                         vector_name,
-                        f"alpha_{alpha_to_slug(alpha)}",
-                    )
-                    os.makedirs(weight_dir, exist_ok=True)
-                    weight_path = os.path.join(weight_dir, f"layer_{layer_idx}.pt")
-                    torch.save(
-                        {
-                            "weight": weight,
-                            "bias": bias,
-                            "mean": mean,
-                            "std": std,
-                            "raw_weight": raw_weight,
-                            "cos_sim": cos_sim,
-                            "vector": vector_name,
-                            "alpha": alpha,
-                            "layer": layer_idx,
-                            "model": model_name_full,
-                        },
-                        weight_path,
+                        os.path.join(output_dir, "probe_plots"),
+                        steer_layer,
                     )
 
-                    stats["cos_sim"] = cos_sim
-                    stats["weight_path"] = weight_path
-                    results[alpha_key][str(layer_idx)] = stats
+                results[str(steer_layer)] = {
+                    "probe_layers": probe_layers,
+                    "alpha_results": alpha_results,
+                }
 
-            plot_cosine_similarity(
-                results,
-                probe_layers,
-                vector_name,
-                os.path.join(output_dir, "cos_sim_plots"),
-            )
             save_path = os.path.join(output_dir, f"probe_{vector_name}.json")
             with open(save_path, "w") as f:
                 json.dump(
                     {
                         "model": model_name_full,
                         "vector": vector_name,
-                        "steer_layer": args.steer_layer,
-                        "probe_layers": probe_layers,
+                        "steer_layers": steer_layers,
                         "alpha_values": alpha_values,
                         "max_prompts": len(prompts),
                         "results": results,
