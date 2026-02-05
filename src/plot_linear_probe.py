@@ -26,7 +26,7 @@ def format_layer_label(layer_idx: int) -> str:
     return f"L{layer_idx}"
 
 
-def plot_vector_grid(
+def plot_layer_grid(
     results: List[Dict],
     title: str,
     output_path: str,
@@ -36,7 +36,15 @@ def plot_vector_grid(
         logger.warning(f"No results to plot for {title}")
         return
 
-    n = len(results)
+    layer_set = set()
+    for item in results:
+        layer_set.update(item.get("probe_layers", []))
+    layers = sorted(layer_set)
+    if not layers:
+        logger.warning(f"No probe layers found for {title}")
+        return
+
+    n = len(layers)
     ncols = min(ncols, n)
     nrows = math.ceil(n / ncols)
 
@@ -44,47 +52,50 @@ def plot_vector_grid(
     fig, axes = plt.subplots(
         nrows, ncols, figsize=(5.2 * ncols, 3.8 * nrows), squeeze=False
     )
-    colors = plt.cm.viridis_r
+    colors = plt.cm.tab20
 
-    for idx, item in enumerate(results):
+    for idx, layer_idx in enumerate(layers):
         row = idx // ncols
         col = idx % ncols
         ax = axes[row][col]
 
-        vector_name = item.get("vector", f"vector_{idx}")
-        alpha_values = item.get("alpha_values", [])
-        probe_layers = item.get("probe_layers", [])
-        result_table = item.get("results", {})
+        has_data = False
+        for j, item in enumerate(results):
+            vector_name = item.get("vector", f"vector_{j}")
+            alpha_values = item.get("alpha_values", [])
+            result_table = item.get("results", {})
+            if not alpha_values or not result_table:
+                continue
 
-        if not alpha_values or not probe_layers or not result_table:
-            ax.set_title(vector_name)
-            ax.text(0.5, 0.5, "No data", ha="center", va="center")
-            ax.axis("off")
-            continue
-
-        color_steps = max(1, len(probe_layers) - 1)
-        for i, layer_idx in enumerate(probe_layers):
-            color = colors(i / color_steps)
             accs = []
             for alpha in alpha_values:
                 alpha_key = str(alpha)
                 layer_stats = result_table.get(alpha_key, {}).get(str(layer_idx), {})
                 accs.append(layer_stats.get("test_acc", float("nan")))
+
+            alpha_percent = [float(alpha) / 100.0 for alpha in alpha_values]
+            color = colors(j % colors.N)
             ax.plot(
-                alpha_values,
+                alpha_percent,
                 accs,
                 marker="o",
-                markersize=4,
-                linewidth=1.6,
+                markersize=3.5,
+                linewidth=1.4,
                 color=color,
-                label=format_layer_label(layer_idx),
+                label=vector_name,
             )
+            has_data = True
+
+        if not has_data:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            ax.axis("off")
+            continue
 
         ax.set_xscale("log")
         ax.set_ylim(0.0, 1.0)
         ax.axhline(0.5, color="#444444", linestyle="--", linewidth=1, alpha=0.7)
-        ax.set_title(vector_name, fontsize=11, fontweight="bold")
-        ax.set_xlabel("Steering strength (alpha)")
+        ax.set_title(format_layer_label(layer_idx), fontsize=11, fontweight="bold")
+        ax.set_xlabel("Steering strength (%)")
         ax.set_ylabel("Probe accuracy")
         ax.tick_params(axis="both", labelsize=9)
 
@@ -141,7 +152,7 @@ def main() -> None:
             logger.error(f"No JSON results found in {input_dir}")
             continue
 
-        plot_vector_grid(
+        plot_layer_grid(
             results,
             title=f"Linear Probe Accuracy ({model_name})",
             output_path=os.path.join(output_dir, "concept_random_combined.png"),
