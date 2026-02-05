@@ -213,3 +213,5 @@ plots/
 llm-steer-instruct/
 68add016f60c62c38be4970d/
 
+# env
+.env

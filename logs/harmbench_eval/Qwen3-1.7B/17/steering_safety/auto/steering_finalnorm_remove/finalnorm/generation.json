@@ -1,0 +1,29 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "dataset": "walledai/HarmBench",
+  "dataset_config": "standard",
+  "split": "train",
+  "sample_size": 20,
+  "seed": 42,
+  "steer_vector": "assets/concept_vectors/Qwen3-1.7B/steering_safety.pt",
+  "steer_layer": 17,
+  "alpha_mode": "auto",
+  "alpha": 10.0,
+  "alpha_zbar": -71.2,
+  "alpha_mean": 10.549999999999997,
+  "final_norm_layer": 17,
+  "final_norm_alpha_layer": 17,
+  "final_norm_alpha_zbar": -71.2,
+  "final_norm_alpha_mean": 10.549999999999997,
+  "remove_at_final_norm": true,
+  "generation": {
+    "max_new_tokens": 256,
+    "temperature": 0.7,
+    "top_p": 0.9
+  },
+  "run_mode": "steering",
+  "run_tag": "steering_finalnorm_remove",
+  "unsteered_avg_length": null,
+  "steered_avg_length": 209.1,
+  "timestamp": "2026-02-05T23:27:40.552774+00:00"
+}

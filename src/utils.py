@@ -44,6 +44,13 @@ CONCEPT_CATEGORIES = {
     ]
 }
 
+CONCEPT_CATEGORIES["steering_safety"] = {
+    "base_path": "dataset/safety_tasks.jsonl",
+    "dataset_key": "prompt",
+    "loader_type": "jsonl",
+    "sub_type": "safety",
+}
+
 
 def set_seed(seed: int) -> None:
     """
