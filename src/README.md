@@ -10,6 +10,20 @@ Use `uv` to run any script:
 uv run python src/<script>.py
 ```
 
+## Run tests
+
+Run the full test suite:
+
+```bash
+uv run pytest
+```
+
+Run a single test file:
+
+```bash
+uv run pytest tests/test_utils.py
+```
+
 ## Common modules
 
 - `src/utils.py`: shared constants and general utilities (models, datasets, plotting).
