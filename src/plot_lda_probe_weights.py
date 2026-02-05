@@ -15,7 +15,7 @@ from utils import get_model_name_for_path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot cosine similarity heatmaps for linear probe weights"
+        description="Plot cosine similarity heatmaps for LDA probe weights"
     )
     parser.add_argument(
         "--model",
@@ -44,12 +44,12 @@ def main() -> None:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="plots/linear_probe_weights",
+        default="plots/lda_probe_weights",
     )
     args = parser.parse_args()
 
     model_name = get_model_name_for_path(args.model)
-    weight_root = os.path.join("assets", "linear_probe", model_name, "probe_weights")
+    weight_root = os.path.join("assets", "lda_probe", model_name, "probe_weights")
     if not os.path.isdir(weight_root):
         raise FileNotFoundError(f"Probe weights directory not found: {weight_root}")
 
@@ -109,7 +109,6 @@ def main() -> None:
                 labels, weights = load_probe_weights_for_steer_layer(
                     steer_dir,
                     probe_layer,
-                    prefer_raw_weight=True,
                 )
                 if not labels:
                     logger.warning(
@@ -131,7 +130,7 @@ def main() -> None:
                     cosine,
                     labels,
                     title=(
-                        f"Probe weight cosine ({concept}) {steer_name} "
+                        f"LDA probe weight cosine ({concept}) {steer_name} "
                         f"probe{probe_layer}"
                     ),
                     output_path=output_path,

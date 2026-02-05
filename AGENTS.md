@@ -7,22 +7,21 @@ Purpose
 Quick Start
 - Python version: 3.13+ (see `pyproject.toml`).
 - Install dependencies with `uv sync`.
-- Run scripts directly with `python src/<script>.py`.
+- Run scripts directly with `uv run python src/<script>.py`.
 
 Build / Lint / Test
-- Build: not configured (no package build script).
-- Lint: not configured (no formatter or linter specified).
-- Tests: not configured (no test runner or test directory).
+- Lint: `uv run ruff check src`
+- Tests: `uv run pytest`
 
 Single Test
-- Not available. There is no test harness or test folder in this repo.
+- `uv run pytest tests/test_smoke.py`
 
 Common Commands
 - Install dependencies: `uv sync`
-- Concept vectors: `python src/extract_concepts.py --model Qwen/Qwen3-1.7B --concept_category steering_detectable_format_json_format`
-- PCA linearity sweep: `python src/pca_linear.py --model Qwen/Qwen3-1.7B --layers 0,6,13,20,27`
-- Plot results: `python src/plot_linear.py` or `python src/plot_linear_n95.py`
-- Steering probe (custom): `python src/steering_linear_probe.py`
+- Concept vectors: `uv run python src/extract_concepts.py --model Qwen/Qwen3-1.7B --concept_category steering_detectable_format_json_format`
+- PCA linearity sweep: `uv run python src/pca_linear.py --model Qwen/Qwen3-1.7B --layers 0,6,13,20,27`
+- Plot results: `uv run python src/plot_linear.py` or `uv run python src/plot_linear_n95.py`
+- Steering probe (custom): `uv run python src/steering_linear_probe.py`
 
 Repository Layout
 - `src/`: research scripts and utilities

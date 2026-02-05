@@ -25,14 +25,22 @@ from utils import seed_from_name
 from utils import set_seed
 
 
-def train_eval_linear_probe(
+def train_eval_lda_probe(
     X: torch.Tensor,
     y: torch.Tensor,
     seed: int,
-    epochs: int,
-    lr: float,
     test_ratio: float,
-) -> Tuple[Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    reg: float,
+) -> Tuple[
+    Dict[str, float],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    float,
+]:
     torch.manual_seed(seed)
     n_samples = X.shape[0]
     perm = torch.randperm(n_samples)
@@ -43,41 +51,60 @@ def train_eval_linear_probe(
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    mean = X_train.mean(dim=0, keepdim=True)
-    std = X_train.std(dim=0, keepdim=True).clamp_min(1e-6)
-    X_train = (X_train - mean) / std
-    X_test = (X_test - mean) / std
+    y_train = y_train.float()
+    y_test = y_test.float()
 
-    model = torch.nn.Linear(X.shape[1], 1)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    mask1 = y_train == 1
+    mask0 = y_train == 0
+    if mask0.sum() == 0 or mask1.sum() == 0:
+        raise RuntimeError("Both classes must be present in training data")
 
-    for _ in range(epochs):
-        logits = model(X_train).squeeze(-1)
-        loss = loss_fn(logits, y_train)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    X0 = X_train[mask0].float()
+    X1 = X_train[mask1].float()
+    mean0 = X0.mean(dim=0)
+    mean1 = X1.mean(dim=0)
+    centered0 = X0 - mean0
+    centered1 = X1 - mean1
 
-    with torch.no_grad():
-        test_logits = model(X_test).squeeze(-1)
-        test_probs = torch.sigmoid(test_logits)
-        test_preds = (test_probs >= 0.5).float()
-        test_acc = (
-            (test_preds == y_test).float().mean().item() if y_test.numel() > 0 else 0.0
-        )
+    cov = (centered0.T @ centered0 + centered1.T @ centered1) / max(
+        1, (X0.shape[0] + X1.shape[0] - 2)
+    )
+    cov = cov + torch.eye(cov.shape[0], device=cov.device) * reg
+
+    diff = (mean1 - mean0).unsqueeze(1)
+    try:
+        weight = torch.linalg.solve(cov, diff).squeeze(1)
+    except RuntimeError:
+        weight = (torch.linalg.pinv(cov) @ diff).squeeze(1)
+
+    prior0 = float(mask0.float().mean().item())
+    prior1 = float(mask1.float().mean().item())
+    log_prior = float(torch.log(torch.tensor(prior1 / prior0)))
+    bias = -0.5 * (mean1 + mean0).dot(weight) + log_prior
+
+    if X_test.numel() == 0:
+        test_acc = 0.0
+    else:
+        scores = X_test.float() @ weight + bias
+        preds = (scores >= 0).float()
+        test_acc = (preds == y_test).float().mean().item()
 
     stats = {
         "test_acc": float(test_acc),
         "train_size": int(X_train.shape[0]),
         "test_size": int(X_test.shape[0]),
     }
-    weight = model.weight.detach().cpu().squeeze(0)
-    bias = model.bias.detach().cpu().squeeze(0)
-    mean = mean.detach().cpu().squeeze(0)
-    std = std.detach().cpu().squeeze(0)
 
-    return stats, weight, bias, mean, std
+    return (
+        stats,
+        weight.detach().cpu(),
+        torch.tensor(bias).detach().cpu(),
+        mean0.detach().cpu(),
+        mean1.detach().cpu(),
+        cov.detach().cpu(),
+        prior0,
+        prior1,
+    )
 
 
 def plot_probe_accuracy(
@@ -118,14 +145,14 @@ def plot_probe_accuracy(
     ax.set_xlabel("Probe layer")
     ax.set_ylabel("Probe accuracy")
     ax.set_title(
-        f"Probe Accuracy ({vector_name}) steer={steer_layer}", fontweight="bold"
+        f"LDA Probe Accuracy ({vector_name}) steer={steer_layer}", fontweight="bold"
     )
     ax.set_ylim(0.0, 1.0)
     ax.legend(frameon=False, ncol=2)
 
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(
-        output_dir, f"probe_acc_{vector_name}_steer_{steer_layer}.png"
+        output_dir, f"lda_probe_acc_{vector_name}_steer_{steer_layer}.png"
     )
     fig.tight_layout()
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -136,15 +163,13 @@ def plot_probe_accuracy(
 def load_all_models_results(
     model_names: List[str],
     vector_name: str,
-    alpha_mode: str,
 ) -> Dict[str, Dict]:
-    """Load results from all models for a given vector."""
     all_results = {}
 
     for model_name_full in model_names:
         model_name = get_model_name_for_path(model_name_full)
         result_path = os.path.join(
-            "assets", "linear_probe", model_name, f"probe_{vector_name}.json"
+            "assets", "lda_probe", model_name, f"lda_probe_{vector_name}.json"
         )
 
         if os.path.exists(result_path):
@@ -162,18 +187,14 @@ def plot_multi_model_probe_accuracy(
     alpha_mode: str,
     alpha_scales: List[float],
 ) -> None:
-    """Plot probe accuracy for all models, with each layer as a subplot."""
     if not all_results:
         logger.warning(f"No results found for {vector_name}")
         return
 
-    # Collect all layers across all models
     all_layers = set()
-    model_layers_map = {}
 
     for model_name, data in all_results.items():
         steer_layers = data.get("steer_layers", [])
-        model_layers_map[model_name] = steer_layers
         all_layers.update(steer_layers)
 
     if not all_layers:
@@ -183,7 +204,6 @@ def plot_multi_model_probe_accuracy(
     all_layers = sorted(all_layers)
     n_layers = len(all_layers)
 
-    # Create subplots: one per layer
     n_cols = min(3, n_layers)
     n_rows = (n_layers + n_cols - 1) // n_cols
 
@@ -192,7 +212,6 @@ def plot_multi_model_probe_accuracy(
         n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows), squeeze=False
     )
 
-    # Color map for models
     colors = plt.cm.tab10.colors
 
     for idx, layer in enumerate(all_layers):
@@ -200,7 +219,6 @@ def plot_multi_model_probe_accuracy(
         col = idx % n_cols
         ax = axes[row, col]
 
-        # Plot each model
         for model_idx, (model_name, data) in enumerate(all_results.items()):
             if layer not in data.get("steer_layers", []):
                 continue
@@ -214,7 +232,7 @@ def plot_multi_model_probe_accuracy(
             for alpha_key in alpha_keys:
                 layer_stats = results.get(alpha_key, {}).get(str(layer), {})
                 acc = layer_stats.get("test_acc", float("nan"))
-                if not (acc != acc):  # not NaN
+                if not (acc != acc):
                     acc_vals.append(acc)
                     alpha_val = float(alpha_key)
                     label = get_alpha_label(alpha_val, alpha_mode, alpha_scales)
@@ -243,16 +261,15 @@ def plot_multi_model_probe_accuracy(
         ax.legend(frameon=False, fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    # Hide unused subplots
     for idx in range(n_layers, n_rows * n_cols):
         row = idx // n_cols
         col = idx % n_cols
         axes[row, col].axis("off")
 
-    fig.suptitle(f"Probe Accuracy - {vector_name}", fontweight="bold", fontsize=14)
+    fig.suptitle(f"LDA Probe Accuracy - {vector_name}", fontweight="bold", fontsize=14)
 
     os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, f"probe_acc_multi_model_{vector_name}.png")
+    save_path = os.path.join(output_dir, f"lda_probe_acc_multi_model_{vector_name}.png")
     fig.tight_layout()
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     fig.savefig(save_path.replace(".png", ".pdf"), bbox_inches="tight")
@@ -262,7 +279,7 @@ def plot_multi_model_probe_accuracy(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Linear probe before/after steering")
+    parser = argparse.ArgumentParser(description="LDA probe before/after steering")
     parser.add_argument(
         "--model",
         type=str,
@@ -295,10 +312,9 @@ def main() -> None:
     )
     parser.add_argument("--max_prompts", type=int, default=8196)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--test_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lda_reg", type=float, default=1e-4)
     args = parser.parse_args()
 
     model_names = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -348,7 +364,7 @@ def main() -> None:
             tokenizer.pad_token = tokenizer.eos_token
 
         model_name = get_model_name_for_path(model_name_full)
-        output_dir = os.path.join("assets", "linear_probe", model_name)
+        output_dir = os.path.join("assets", "lda_probe", model_name)
         os.makedirs(output_dir, exist_ok=True)
 
         alpha_values_by_layer: Dict[int, List[float]] = {}
@@ -498,16 +514,22 @@ def main() -> None:
                         probe_seed = seed_from_name(
                             f"{vector_name}-{steer_layer}-{alpha}-{layer_idx}"
                         )
-                        stats, weight, bias, mean, std = train_eval_linear_probe(
+                        (
+                            stats,
+                            weight,
+                            bias,
+                            mean0,
+                            mean1,
+                            cov,
+                            prior0,
+                            prior1,
+                        ) = train_eval_lda_probe(
                             X,
                             y,
                             seed=probe_seed,
-                            epochs=args.epochs,
-                            lr=args.lr,
                             test_ratio=args.test_ratio,
+                            reg=args.lda_reg,
                         )
-                        std = std.clamp_min(1e-6)
-                        raw_weight = weight / std
 
                         weight_dir = os.path.join(
                             output_dir,
@@ -522,9 +544,12 @@ def main() -> None:
                             {
                                 "weight": weight,
                                 "bias": bias,
-                                "mean": mean,
-                                "std": std,
-                                "raw_weight": raw_weight,
+                                "mean0": mean0,
+                                "mean1": mean1,
+                                "cov": cov,
+                                "cov_reg": args.lda_reg,
+                                "prior0": prior0,
+                                "prior1": prior1,
                                 "vector": vector_name,
                                 "alpha": alpha,
                                 "alpha_percent": alpha_percent,
@@ -576,7 +601,7 @@ def main() -> None:
                 alpha_to_percent(alpha) for alpha in plot_alpha_values
             ]
 
-            save_path = os.path.join(output_dir, f"probe_{vector_name}.json")
+            save_path = os.path.join(output_dir, f"lda_probe_{vector_name}.json")
             with open(save_path, "w") as f:
                 alpha_values_by_layer_str = {
                     str(k): v for k, v in alpha_values_by_layer.items()
@@ -617,22 +642,22 @@ def main() -> None:
                         "probe_layers": steer_layers,
                         "results": plot_results,
                         "results_by_steer_layer": results,
+                        "lda_reg": args.lda_reg,
                     },
                     f,
                     indent=2,
                 )
             logger.info(f"Saved results to {save_path}")
 
-    # After processing all models, create combined plots for each concept
     logger.info("Creating multi-model comparison plots...")
     all_vector_names = concepts + random_dirs
     for vector_name in all_vector_names:
-        all_results = load_all_models_results(model_names, vector_name, args.alpha_mode)
+        all_results = load_all_models_results(model_names, vector_name)
         if all_results:
             plot_multi_model_probe_accuracy(
                 all_results,
                 vector_name,
-                os.path.join("assets", "linear_probe", "combined_plots"),
+                os.path.join("assets", "lda_probe", "combined_plots"),
                 args.alpha_mode,
                 alpha_scales,
             )
