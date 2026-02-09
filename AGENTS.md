@@ -20,7 +20,7 @@ Common Commands
 - Install dependencies: `uv sync`
 - Concept vectors: `uv run python src/extract_concepts.py --model Qwen/Qwen3-1.7B --concept_category steering_detectable_format_json_format`
 - PCA linearity sweep: `uv run python src/pca_linear.py --model Qwen/Qwen3-1.7B --layers 0,6,13,20,27`
-- Plot results: `uv run python src/plot_linear.py` or `uv run python src/plot_linear_n95.py`
+- Plot results: `uv run python src/plot/plot_linear.py` or `uv run python src/plot/plot_linear_n95.py`
 - Steering probe (custom): `uv run python src/steering_linear_probe.py`
 
 Repository Layout

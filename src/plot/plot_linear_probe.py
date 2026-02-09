@@ -1,12 +1,20 @@
+# ruff: noqa: E402
+
 import argparse
 import glob
 import json
 import math
 import os
+from pathlib import Path
+import sys
 from typing import Dict, List
 
 import matplotlib.pyplot as plt
 from loguru import logger
+
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from utils import get_model_name_for_path
 

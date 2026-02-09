@@ -1,10 +1,18 @@
+# ruff: noqa: E402
+
 import argparse
 import json
 import math
 import os
+from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from utils import (
     CONCEPT_CATEGORIES,

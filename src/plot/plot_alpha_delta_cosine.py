@@ -1,13 +1,22 @@
+# ruff: noqa: E402
+
 import argparse
+from pathlib import Path
 import os
-from typing import Dict, List, Tuple
 import json
+import sys
+from typing import Dict, List, Tuple
+
 from loguru import logger
 import torch
 import transformers
 
-from plot_probe_utils import compute_cosine_similarity
-from plot_probe_utils import plot_cosine_heatmap
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from plot.plot_probe_utils import compute_cosine_similarity
+from plot.plot_probe_utils import plot_cosine_heatmap
 from probe_utils import (
     compute_avg_hidden_norm,
     get_alpha_label,

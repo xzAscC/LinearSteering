@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import sys
 from pathlib import Path
 
@@ -8,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from plot_alpha_delta_cosine import compute_delta_means_by_alpha
+from plot.plot_alpha_delta_cosine import compute_delta_means_by_alpha
 
 
 class DummyBatch:
@@ -55,7 +57,7 @@ def test_compute_delta_means_by_alpha(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(
-        "plot_alpha_delta_cosine.run_model_capture_layers",
+        "plot.plot_alpha_delta_cosine.run_model_capture_layers",
         fake_run_model_capture_layers,
     )
 

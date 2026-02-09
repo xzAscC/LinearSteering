@@ -115,6 +115,17 @@ def resolve_concept_name(steer_vector: str) -> str:
     return steer_vector
 
 
+def _to_unit_vector(vector: torch.Tensor, error_message: str) -> torch.Tensor:
+    norm = vector.norm().item()
+    if norm == 0:
+        raise ValueError(error_message)
+    return vector / norm
+
+
+def _average(values: List[float]) -> Optional[float]:
+    return (sum(values) / len(values)) if values else None
+
+
 def compute_projection_for_prompt(
     model,
     tokenizer,
@@ -388,24 +399,21 @@ def main() -> None:
             final_norm_vector = steering_tensor
             final_norm_alpha_vector = steering_tensor
 
-    vector_norm = steering_vector.norm().item()
-    if vector_norm == 0:
-        raise ValueError("Steering vector has zero norm")
-    steering_unit = steering_vector / vector_norm
+    steering_unit = _to_unit_vector(steering_vector, "Steering vector has zero norm")
 
     final_norm_unit = None
     if final_norm_vector is not None:
-        final_norm_norm = final_norm_vector.norm().item()
-        if final_norm_norm == 0:
-            raise ValueError("Final norm steering vector has zero norm")
-        final_norm_unit = final_norm_vector / final_norm_norm
+        final_norm_unit = _to_unit_vector(
+            final_norm_vector,
+            "Final norm steering vector has zero norm",
+        )
 
     final_norm_alpha_unit = None
     if final_norm_alpha_vector is not None:
-        final_norm_alpha_norm = final_norm_alpha_vector.norm().item()
-        if final_norm_alpha_norm == 0:
-            raise ValueError("Final norm alpha vector has zero norm")
-        final_norm_alpha_unit = final_norm_alpha_vector / final_norm_alpha_norm
+        final_norm_alpha_unit = _to_unit_vector(
+            final_norm_alpha_vector,
+            "Final norm alpha vector has zero norm",
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -601,12 +609,8 @@ def main() -> None:
         r["unsteered_length"] for r in records if "unsteered_length" in r
     ]
     steered_lengths = [r["steered_length"] for r in records if "steered_length" in r]
-    unsteered_avg_len = (
-        sum(unsteered_lengths) / len(unsteered_lengths) if unsteered_lengths else None
-    )
-    steered_avg_len = (
-        sum(steered_lengths) / len(steered_lengths) if steered_lengths else None
-    )
+    unsteered_avg_len = _average(unsteered_lengths)
+    steered_avg_len = _average(steered_lengths)
 
     summary = {
         "model": args.model,

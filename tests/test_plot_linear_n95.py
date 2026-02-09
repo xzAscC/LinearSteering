@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import plot_linear_n95
+from plot import plot_linear_n95
 
 
 def test_plot_linearity_n95_creates_output(tmp_path, monkeypatch) -> None:

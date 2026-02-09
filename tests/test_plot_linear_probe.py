@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-import plot_linear_probe
+from plot import plot_linear_probe
 
 
 def test_load_probe_results(tmp_path) -> None:
