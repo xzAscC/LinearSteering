@@ -1,7 +1,6 @@
 import argparse
 import glob
 import os
-from typing import List, Optional
 
 from loguru import logger
 

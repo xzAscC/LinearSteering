@@ -12,8 +12,6 @@ from loguru import logger
 from utils import (
     CONCEPT_CATEGORIES,
     MODEL_LAYERS,
-    apply_plot_style,
-    build_plot_config,
     get_model_name_for_path,
     load_concept_datasets,
     parse_layers_to_run,
@@ -24,7 +22,7 @@ from utils import (
 
 def parse_example_sizes(sizes_arg: str) -> list[int]:
     sizes = [int(x.strip()) for x in sizes_arg.split(",") if x.strip()]
-    return sorted(list({s for s in sizes if s > 0}))
+    return sorted({s for s in sizes if s > 0})
 
 
 def parse_reference_size(reference_arg: Optional[str]) -> Optional[int]:
@@ -147,126 +145,32 @@ def summarize_pairwise(vectors: list[torch.Tensor]) -> Optional[dict]:
     }
 
 
-def plot_stability_on_ax(results: dict, concept_name: str, ax) -> None:
-    import matplotlib.pyplot as plt
-
-    sizes = [int(s) for s in results.get("token_sizes", results["example_sizes"])]
-    sizes = sorted(sizes)
-
-    means = []
-    stds = []
-    for size in sizes:
-        metrics = results["metrics"][str(size)]["cosine_to_reference"]
-        means.append(metrics["mean"])
-        stds.append(metrics["std"])
-
-    ax.plot(sizes, means, marker="o", linewidth=2, color="#1f77b4")
-    ax.fill_between(
-        sizes,
-        np.array(means) - np.array(stds),
-        np.array(means) + np.array(stds),
-        alpha=0.2,
-        color="#1f77b4",
-    )
-    ax.set_xscale("log")
-    ax.set_xlabel("Number of tokens")
-    ax.set_ylabel("Cosine similarity to reference")
-    ax.set_title(f"Stability vs. token budget: {concept_name}")
-    ax.grid(True, linestyle="--", alpha=0.6)
-
-    reference_size = results.get("reference_size")
-    if reference_size is not None and reference_size < 0:
-        reference_tokens = results.get("reference_tokens", {}).get("total_tokens")
-        if reference_tokens is not None:
-            ax.text(
-                0.02,
-                0.98,
-                f"ref=all ({reference_tokens} tokens)",
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=10,
-                color="#444444",
+def build_cosine_by_run(
+    cosines: list[torch.Tensor],
+    layers: list[int],
+    tokens_by_run: list[dict[str, int]],
+) -> list[dict]:
+    records = []
+    for run_idx, cosine in enumerate(cosines):
+        per_layer = []
+        for layer_pos, layer_idx in enumerate(layers):
+            per_layer.append(
+                {
+                    "layer": layer_idx,
+                    "cosine_similarity": float(cosine[layer_pos].item()),
+                }
             )
 
-    max_size = max(sizes)
-    max_idx = sizes.index(max_size)
-    max_mean = means[max_idx]
-    ax.scatter([max_size], [max_mean], color="#d62728", zorder=3)
-    ax.annotate(
-        f"max={max_size}",
-        xy=(max_size, max_mean),
-        xytext=(8, 8),
-        textcoords="offset points",
-        fontsize=10,
-        color="#d62728",
-    )
-
-
-def plot_stability(results: dict, model_name: str, concept_name: str) -> None:
-    import matplotlib.pyplot as plt
-
-    plot_config = build_plot_config(
-        {
-            "figsize": (10, 6),
-            "rc_params": {"axes.titlesize": 16, "axes.labelsize": 14},
-        }
-    )
-    apply_plot_style(plot_config["style"], plot_config["rc_params"])
-
-    os.makedirs("plots", exist_ok=True)
-    fig, ax = plt.subplots(figsize=plot_config["figsize"])
-    plot_stability_on_ax(results, concept_name, ax)
-    plot_path = os.path.join("plots", f"stability_{model_name}_{concept_name}.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_stability_grid(results_by_concept: dict, model_name: str) -> None:
-    import math
-    import matplotlib.pyplot as plt
-
-    plot_config = build_plot_config(
-        {
-            "figsize": (12, 8),
-            "rc_params": {"axes.titlesize": 14, "axes.labelsize": 12},
-        }
-    )
-    apply_plot_style(plot_config["style"], plot_config["rc_params"])
-
-    concepts = list(results_by_concept.keys())
-    total = len(concepts)
-    if total == 0:
-        return
-
-    ncols = 2 if total > 1 else 1
-    nrows = math.ceil(total / ncols)
-    fig, axes = plt.subplots(
-        nrows=nrows,
-        ncols=ncols,
-        figsize=(6 * ncols, 4 * nrows),
-        squeeze=False,
-    )
-
-    for idx, concept_name in enumerate(concepts):
-        row = idx // ncols
-        col = idx % ncols
-        plot_stability_on_ax(
-            results_by_concept[concept_name], concept_name, axes[row][col]
+        records.append(
+            {
+                "run": run_idx,
+                "tokens": tokens_by_run[run_idx],
+                "mean": float(cosine.mean().item()),
+                "std": float(cosine.std(unbiased=False).item()),
+                "per_layer": per_layer,
+            }
         )
-
-    for idx in range(total, nrows * ncols):
-        row = idx // ncols
-        col = idx % ncols
-        axes[row][col].axis("off")
-
-    fig.suptitle(f"Stability vs. token budget: {model_name}", fontsize=16)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    os.makedirs("plots", exist_ok=True)
-    plot_path = os.path.join("plots", f"stability_{model_name}_all.png")
-    fig.savefig(plot_path, dpi=200)
-    plt.close(fig)
+    return records
 
 
 def main() -> None:
@@ -372,8 +276,6 @@ def main() -> None:
 
     model_name = get_model_name_for_path(args.model)
 
-    results_by_concept = {}
-
     for concept_category in concept_categories:
         logger.info(f"Processing concept category: {concept_category}")
 
@@ -381,17 +283,14 @@ def main() -> None:
             concept_category, CONCEPT_CATEGORIES[concept_category]
         )
 
-        available_examples = min(len(positive_dataset), len(negative_dataset))
-        if available_examples <= 0:
+        pos_dataset_size = len(positive_dataset)
+        neg_dataset_size = len(negative_dataset)
+        if min(pos_dataset_size, neg_dataset_size) <= 0:
             raise ValueError("No available examples in positive/negative datasets")
 
         reference_seed = seed_from_name(f"{concept_category}-reference") + args.seed
-        pos_ref = sample_dataset(
-            positive_dataset, len(positive_dataset), reference_seed
-        )
-        neg_ref = sample_dataset(
-            negative_dataset, len(negative_dataset), reference_seed + 1
-        )
+        pos_ref = sample_dataset(positive_dataset, pos_dataset_size, reference_seed)
+        neg_ref = sample_dataset(negative_dataset, neg_dataset_size, reference_seed + 1)
 
         with torch.no_grad():
             reference_vector, ref_pos_tokens, ref_neg_tokens = compute_concept_vector(
@@ -405,19 +304,22 @@ def main() -> None:
                 dtype,
             )
             reference_vector = reference_vector.detach()
+        reference_vector_cpu = reference_vector.cpu()
         reference_tokens_total = ref_pos_tokens + ref_neg_tokens
 
         save_dir = os.path.join(
-            "assets", "concept_vector_stability", model_name, concept_category
+            "assets", "concept_vector_stability_cosine", model_name, concept_category
         )
         os.makedirs(save_dir, exist_ok=True)
 
         torch.save(
-            reference_vector.cpu(), os.path.join(save_dir, "concept_vector_ref.pt")
+            reference_vector_cpu, os.path.join(save_dir, "concept_vector_ref.pt")
         )
 
         results = {
             "model": args.model,
+            "model_name": model_name,
+            "concept_name": concept_category,
             "concept_category": concept_category,
             "layers": layers_to_run,
             "example_sizes": token_sizes,
@@ -436,18 +338,17 @@ def main() -> None:
             logger.info(f"Evaluating token size {size}")
             vectors = []
             cosines_to_ref = []
+            tokens_by_run = []
 
             for r in range(args.repeats):
                 seed = seed_from_name(f"{concept_category}-{size}-{r}") + args.seed
-                pos_sample = sample_dataset(
-                    positive_dataset, len(positive_dataset), seed
-                )
+                pos_sample = sample_dataset(positive_dataset, pos_dataset_size, seed)
                 neg_sample = sample_dataset(
-                    negative_dataset, len(negative_dataset), seed + 1
+                    negative_dataset, neg_dataset_size, seed + 1
                 )
 
                 with torch.no_grad():
-                    vec, _, _ = compute_concept_vector(
+                    vec, pos_tokens, neg_tokens = compute_concept_vector(
                         model,
                         pos_sample,
                         neg_sample,
@@ -462,11 +363,23 @@ def main() -> None:
                 vec_cpu = vec.cpu()
                 vectors.append(vec_cpu)
                 cosines_to_ref.append(
-                    F.cosine_similarity(vec_cpu, reference_vector.cpu(), dim=1)
+                    F.cosine_similarity(vec_cpu, reference_vector_cpu, dim=1)
+                )
+                tokens_by_run.append(
+                    {
+                        "pos_tokens": pos_tokens,
+                        "neg_tokens": neg_tokens,
+                        "total_tokens": pos_tokens + neg_tokens,
+                    }
                 )
 
             summary = {
                 "cosine_to_reference": summarize_cosines(cosines_to_ref),
+                "cosine_by_run": build_cosine_by_run(
+                    cosines_to_ref,
+                    layers_to_run,
+                    tokens_by_run,
+                ),
             }
             pairwise = summarize_pairwise(vectors)
             if pairwise is not None:
@@ -482,20 +395,10 @@ def main() -> None:
 
             results["metrics"][str(size)] = summary
 
-        results_path = os.path.join(save_dir, "stability_results.json")
+        results_path = os.path.join(save_dir, "cosine_similarity.json")
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2)
-
-        plot_stability(
-            results,
-            model_name=model_name,
-            concept_name=concept_category,
-        )
-        results_by_concept[concept_category] = results
         logger.info(f"Saved results to {results_path}")
-
-    if len(concept_categories) > 1:
-        plot_stability_grid(results_by_concept, model_name=model_name)
 
 
 if __name__ == "__main__":
