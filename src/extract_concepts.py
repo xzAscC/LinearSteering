@@ -2,7 +2,10 @@ import argparse
 import gc
 import json
 import os
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any
+from typing import Dict
+from typing import Optional
+from typing import Tuple
 
 import datasets
 import torch

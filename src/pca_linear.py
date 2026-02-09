@@ -1,22 +1,21 @@
 import argparse
-import torch
-import transformers
 import os
-import torch.nn.functional as F
-from utils import (
-    MODEL_LAYERS,
-    CONCEPT_CATEGORIES,
-    set_seed,
-    run_model_with_steering,
-    hidden_to_flat,
-    get_model_name_for_path,
-    parse_layers_to_run,
-    load_concept_datasets,
-)
+import torch
 import torch.multiprocessing as mp
-import math
+import transformers
 from loguru import logger
 from tqdm import tqdm
+
+from utils import (
+    CONCEPT_CATEGORIES,
+    get_model_name_for_path,
+    hidden_to_flat,
+    load_concept_datasets,
+    MODEL_LAYERS,
+    parse_layers_to_run,
+    run_model_with_steering,
+    set_seed,
+)
 
 
 class PCAStatisticsAggregator:
@@ -104,54 +103,6 @@ class PCAStatisticsAggregator:
             "mean_n95": mean_n95,
             "std_n95": var_n95**0.5,
         }
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help=f"Model name to process. If not specified, process all models. Available: {list(MODEL_LAYERS.keys())}",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--test_size", type=int, default=16)
-    parser.add_argument(
-        "--max_tokens",
-        type=int,
-        default=500,
-        help="Maximum number of tokens to use from the dataset",
-    )
-    # Trajectory sweep parameters
-    parser.add_argument("--alpha_min", type=float, default=1)
-    parser.add_argument("--alpha_max", type=float, default=1e6)
-    parser.add_argument(
-        "--alpha_points", type=int, default=200
-    )  # Fewer points than smoothness
-
-    parser.add_argument(
-        "--layers",
-        type=str,
-        default="50",
-        help="Comma-separated percentages or layer indices.",
-    )
-    parser.add_argument(
-        "--remove_concept_vector",
-        action="store_true",
-        help="Remove concept vector from hidden states",
-    )
-    args = parser.parse_args()
-
-    os.makedirs("logs", exist_ok=True)
-    logger.add("logs/linear.log")
-    logger.info(f"args: {args}")
-    set_seed(args.seed)
-
-    models_to_process = (
-        [(args.model, MODEL_LAYERS[args.model])]
-        if args.model is not None
-        else list(MODEL_LAYERS.items())
-    )
 
 
 def worker_process(rank, world_size, model_full_name, task_queue, args, max_layers):
