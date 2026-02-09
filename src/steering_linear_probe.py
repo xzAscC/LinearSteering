@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import torch
 import transformers
 from loguru import logger
+from tqdm import tqdm
 
 from probe_utils import (
     alpha_to_percent,
@@ -269,6 +270,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    logger.remove()
     run_id, run_timestamp, params_hash = _build_run_metadata(args)
 
     model_names = [m.strip() for m in args.model.split(",") if m.strip()]
@@ -430,21 +432,14 @@ def main() -> None:
             )
 
         for concept_name, vector_name, vector_path, prompts in vector_specs:
-            logger.info(
-                "Processing concept: {} | vector: {}",
-                concept_name,
-                vector_name,
-            )
             vector_tensor = load_vector(vector_path)
             results_by_hook_point = {}
             merged_results_by_hook_point = {}
             merged_alpha_values_by_hook_point = {}
             merged_alpha_values_percent_by_hook_point = {}
 
+            total_probe_evals = 0
             for hook_point in hook_points:
-                logger.info(f"Running probe for hook point: {hook_point}")
-                results = {}
-
                 for steer_layer in steer_layers:
                     alpha_values = manual_alpha_values
                     if args.alpha_mode == "avg_norm":
@@ -452,9 +447,6 @@ def main() -> None:
                             hook_point, {}
                         ).get(steer_layer, [])
                     if not alpha_values:
-                        logger.warning(
-                            f"Skipping steer layer {steer_layer}: no alpha values"
-                        )
                         continue
                     probe_layers = _resolve_layers_to_run(
                         args.probe_layers,
@@ -462,183 +454,208 @@ def main() -> None:
                         min_layer_exclusive=steer_layer,
                     )
                     if not probe_layers:
-                        logger.warning(
-                            (
-                                f"Skipping steer layer {steer_layer}: "
-                                "no probe layers above steer layer"
-                            )
-                        )
                         continue
-                    logger.info(
-                        (
-                            f"Hook: {hook_point} | "
-                            f"Steer layer: {steer_layer} | "
-                            f"Identity-free probe layers: {probe_layers}"
+                    total_probe_evals += len(alpha_values) * len(probe_layers)
+
+            with tqdm(
+                total=total_probe_evals,
+                desc=f"{model_name}:{vector_name}",
+                unit="probe",
+            ) as pbar:
+                for hook_point in hook_points:
+                    results = {}
+
+                    for steer_layer in steer_layers:
+                        alpha_values = manual_alpha_values
+                        if args.alpha_mode == "avg_norm":
+                            alpha_values = alpha_values_by_hook_layer.get(
+                                hook_point, {}
+                            ).get(steer_layer, [])
+                        if not alpha_values:
+                            continue
+                        probe_layers = _resolve_layers_to_run(
+                            args.probe_layers,
+                            max_layers,
+                            min_layer_exclusive=steer_layer,
                         )
-                    )
+                        if not probe_layers:
+                            continue
 
-                    if vector_tensor.ndim == 1:
-                        steering_vector = vector_tensor
-                    else:
-                        steering_vector = vector_tensor[steer_layer]
+                        if vector_tensor.ndim == 1:
+                            steering_vector = vector_tensor
+                        else:
+                            steering_vector = vector_tensor[steer_layer]
 
-                    alpha_results: Dict[str, Dict[str, Dict[str, float]]] = {}
+                        alpha_results: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-                    for alpha in alpha_values:
-                        alpha_percent = alpha_to_percent(alpha)
-                        logger.info(f"Alpha: {alpha_percent:g}%")
-                        layer_features_before: Dict[int, List[torch.Tensor]] = {
-                            layer_idx: [] for layer_idx in probe_layers
-                        }
-                        layer_features_after: Dict[int, List[torch.Tensor]] = {
-                            layer_idx: [] for layer_idx in probe_layers
-                        }
+                        for alpha in alpha_values:
+                            alpha_percent = alpha_to_percent(alpha)
+                            layer_features_before: Dict[int, List[torch.Tensor]] = {
+                                layer_idx: [] for layer_idx in probe_layers
+                            }
+                            layer_features_after: Dict[int, List[torch.Tensor]] = {
+                                layer_idx: [] for layer_idx in probe_layers
+                            }
 
-                        for i in range(0, len(prompts), args.batch_size):
-                            batch_prompts = prompts[i : i + args.batch_size]
-                            inputs = tokenizer(
-                                batch_prompts,
-                                return_tensors="pt",
-                                padding=True,
-                                truncation=True,
-                            ).to(device)
+                            for i in range(0, len(prompts), args.batch_size):
+                                batch_prompts = prompts[i : i + args.batch_size]
+                                inputs = tokenizer(
+                                    batch_prompts,
+                                    return_tensors="pt",
+                                    padding=True,
+                                    truncation=True,
+                                ).to(device)
 
-                            capture_layers = sorted(set(probe_layers + [steer_layer]))
-                            captured_before = run_model_capture_layers(
-                                model,
-                                inputs.input_ids,
-                                capture_layers,
-                                device,
-                                capture_hook_point=hook_point,
-                                steering_vector=steering_vector,
-                                steer_layer=steer_layer,
-                                alpha=0.0,
-                            )
-                            captured_after = run_model_capture_layers(
-                                model,
-                                inputs.input_ids,
-                                capture_layers,
-                                device,
-                                capture_hook_point=hook_point,
-                                steering_vector=steering_vector,
-                                steer_layer=steer_layer,
-                                alpha=alpha,
-                            )
+                                capture_layers = sorted(
+                                    set(probe_layers + [steer_layer])
+                                )
+                                captured_before = run_model_capture_layers(
+                                    model,
+                                    inputs.input_ids,
+                                    capture_layers,
+                                    device,
+                                    capture_hook_point=hook_point,
+                                    steering_vector=steering_vector,
+                                    steer_layer=steer_layer,
+                                    alpha=0.0,
+                                )
+                                captured_after = run_model_capture_layers(
+                                    model,
+                                    inputs.input_ids,
+                                    capture_layers,
+                                    device,
+                                    capture_hook_point=hook_point,
+                                    steering_vector=steering_vector,
+                                    steer_layer=steer_layer,
+                                    alpha=alpha,
+                                )
 
-                            token_mask = inputs.attention_mask.bool()
-                            h_before_steer = captured_before[steer_layer]
-                            h_after_steer = captured_after[steer_layer]
+                                token_mask = inputs.attention_mask.bool()
+                                h_before_steer = captured_before[steer_layer]
+                                h_after_steer = captured_after[steer_layer]
+                                for layer_idx in probe_layers:
+                                    h_before = captured_before[layer_idx]
+                                    h_after = captured_after[layer_idx]
+                                    z_before = h_before - h_before_steer
+                                    z_after = h_after - h_after_steer
+                                    token_before = z_before[token_mask].float().cpu()
+                                    token_after = z_after[token_mask].float().cpu()
+                                    layer_features_before[layer_idx].append(
+                                        token_before
+                                    )
+                                    layer_features_after[layer_idx].append(token_after)
+
+                            alpha_key = str(alpha)
+                            alpha_results[alpha_key] = {}
                             for layer_idx in probe_layers:
-                                h_before = captured_before[layer_idx]
-                                h_after = captured_after[layer_idx]
-                                z_before = h_before - h_before_steer
-                                z_after = h_after - h_after_steer
-                                token_before = z_before[token_mask].float().cpu()
-                                token_after = z_after[token_mask].float().cpu()
-                                layer_features_before[layer_idx].append(token_before)
-                                layer_features_after[layer_idx].append(token_after)
+                                X_before = torch.cat(
+                                    layer_features_before[layer_idx], dim=0
+                                )
+                                X_after = torch.cat(
+                                    layer_features_after[layer_idx], dim=0
+                                )
+                                X = torch.cat([X_before, X_after], dim=0)
+                                y = torch.cat(
+                                    [
+                                        torch.zeros(X_before.shape[0]),
+                                        torch.ones(X_after.shape[0]),
+                                    ],
+                                    dim=0,
+                                )
+                                probe_seed = seed_from_name(
+                                    f"{vector_name}-{hook_point}-{steer_layer}-{alpha}-{layer_idx}"
+                                )
+                                stats, weight, bias, mean, std = (
+                                    train_eval_linear_probe(
+                                        X,
+                                        y,
+                                        seed=probe_seed,
+                                        epochs=args.epochs,
+                                        lr=args.lr,
+                                        test_ratio=args.test_ratio,
+                                    )
+                                )
+                                std = std.clamp_min(1e-6)
+                                raw_weight = weight / std
 
-                        alpha_key = str(alpha)
-                        alpha_results[alpha_key] = {}
-                        for layer_idx in probe_layers:
-                            X_before = torch.cat(
-                                layer_features_before[layer_idx], dim=0
-                            )
-                            X_after = torch.cat(layer_features_after[layer_idx], dim=0)
-                            X = torch.cat([X_before, X_after], dim=0)
-                            y = torch.cat(
-                                [
-                                    torch.zeros(X_before.shape[0]),
-                                    torch.ones(X_after.shape[0]),
-                                ],
-                                dim=0,
-                            )
-                            probe_seed = seed_from_name(
-                                f"{vector_name}-{hook_point}-{steer_layer}-{alpha}-{layer_idx}"
-                            )
-                            stats, weight, bias, mean, std = train_eval_linear_probe(
-                                X,
-                                y,
-                                seed=probe_seed,
-                                epochs=args.epochs,
-                                lr=args.lr,
-                                test_ratio=args.test_ratio,
-                            )
-                            std = std.clamp_min(1e-6)
-                            raw_weight = weight / std
+                                weight_dir = os.path.join(
+                                    output_dir,
+                                    "probe_weights",
+                                    vector_name,
+                                    f"run_{run_id}",
+                                    f"hook_{hook_point}",
+                                    f"steer_{steer_layer}",
+                                    f"alpha_{alpha_to_slug(alpha)}",
+                                )
+                                os.makedirs(weight_dir, exist_ok=True)
+                                weight_path = os.path.join(
+                                    weight_dir, f"layer_{layer_idx}.pt"
+                                )
+                                torch.save(
+                                    {
+                                        "weight": weight,
+                                        "bias": bias,
+                                        "mean": mean,
+                                        "std": std,
+                                        "raw_weight": raw_weight,
+                                        "vector": vector_name,
+                                        "alpha": alpha,
+                                        "alpha_percent": alpha_percent,
+                                        "steer_layer": steer_layer,
+                                        "layer": layer_idx,
+                                        "hook_point": hook_point,
+                                        "model": model_name_full,
+                                    },
+                                    weight_path,
+                                )
 
-                            weight_dir = os.path.join(
-                                output_dir,
-                                "probe_weights",
-                                vector_name,
-                                f"run_{run_id}",
-                                f"hook_{hook_point}",
-                                f"steer_{steer_layer}",
-                                f"alpha_{alpha_to_slug(alpha)}",
-                            )
-                            os.makedirs(weight_dir, exist_ok=True)
-                            weight_path = os.path.join(
-                                weight_dir, f"layer_{layer_idx}.pt"
-                            )
-                            torch.save(
-                                {
-                                    "weight": weight,
-                                    "bias": bias,
-                                    "mean": mean,
-                                    "std": std,
-                                    "raw_weight": raw_weight,
-                                    "vector": vector_name,
-                                    "alpha": alpha,
-                                    "alpha_percent": alpha_percent,
-                                    "steer_layer": steer_layer,
-                                    "layer": layer_idx,
-                                    "hook_point": hook_point,
-                                    "model": model_name_full,
-                                },
-                                weight_path,
-                            )
+                                alpha_results[alpha_key][str(layer_idx)] = stats
+                                pbar.set_postfix_str(
+                                    f"test_acc={stats['test_acc']:.4f}"
+                                )
+                                pbar.update(1)
 
-                            alpha_results[alpha_key][str(layer_idx)] = stats
+                        results[str(steer_layer)] = {
+                            "probe_layers": probe_layers,
+                            "alpha_results": alpha_results,
+                        }
 
-                    results[str(steer_layer)] = {
-                        "probe_layers": probe_layers,
-                        "alpha_results": alpha_results,
-                    }
-
-                merged_alpha_keys = set()
-                merged_results: Dict[str, Dict[str, Dict[str, float]]] = {}
-                for steer_layer in steer_layers:
-                    layer_payload = results.get(str(steer_layer), {})
-                    alpha_results = layer_payload.get("alpha_results", {})
-                    for alpha_key in alpha_results:
-                        merged_alpha_keys.add(alpha_key)
-
-                merged_alpha_keys_sorted = sorted(
-                    merged_alpha_keys,
-                    key=lambda x: float(x),
-                )
-                for alpha_key in merged_alpha_keys_sorted:
-                    merged_results[alpha_key] = {}
+                    merged_alpha_keys = set()
+                    merged_results: Dict[str, Dict[str, Dict[str, float]]] = {}
                     for steer_layer in steer_layers:
                         layer_payload = results.get(str(steer_layer), {})
                         alpha_results = layer_payload.get("alpha_results", {})
-                        layer_stats = alpha_results.get(alpha_key, {}).get(
-                            str(steer_layer)
-                        )
-                        if layer_stats:
-                            merged_results[alpha_key][str(steer_layer)] = layer_stats
+                        for alpha_key in alpha_results:
+                            merged_alpha_keys.add(alpha_key)
 
-                merged_alpha_values = [float(a) for a in merged_alpha_keys_sorted]
-                merged_alpha_values_percent = [
-                    alpha_to_percent(alpha) for alpha in merged_alpha_values
-                ]
+                    merged_alpha_keys_sorted = sorted(
+                        merged_alpha_keys,
+                        key=lambda x: float(x),
+                    )
+                    for alpha_key in merged_alpha_keys_sorted:
+                        merged_results[alpha_key] = {}
+                        for steer_layer in steer_layers:
+                            layer_payload = results.get(str(steer_layer), {})
+                            alpha_results = layer_payload.get("alpha_results", {})
+                            layer_stats = alpha_results.get(alpha_key, {}).get(
+                                str(steer_layer)
+                            )
+                            if layer_stats:
+                                merged_results[alpha_key][str(steer_layer)] = (
+                                    layer_stats
+                                )
 
-                results_by_hook_point[hook_point] = results
-                merged_results_by_hook_point[hook_point] = merged_results
-                merged_alpha_values_by_hook_point[hook_point] = merged_alpha_values
-                merged_alpha_values_percent_by_hook_point[hook_point] = (
-                    merged_alpha_values_percent
-                )
+                    merged_alpha_values = [float(a) for a in merged_alpha_keys_sorted]
+                    merged_alpha_values_percent = [
+                        alpha_to_percent(alpha) for alpha in merged_alpha_values
+                    ]
+
+                    results_by_hook_point[hook_point] = results
+                    merged_results_by_hook_point[hook_point] = merged_results
+                    merged_alpha_values_by_hook_point[hook_point] = merged_alpha_values
+                    merged_alpha_values_percent_by_hook_point[hook_point] = (
+                        merged_alpha_values_percent
+                    )
 
             primary_hook_point = hook_points[0]
             primary_merged_alpha_values = merged_alpha_values_by_hook_point.get(
@@ -722,7 +739,6 @@ def main() -> None:
             )
             with open(save_path, "w") as f:
                 json.dump(payload, f, indent=2)
-            logger.info(f"Saved results to {save_path}")
 
 
 if __name__ == "__main__":

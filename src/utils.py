@@ -485,11 +485,16 @@ def _pca_hooks_result_path(
 def _pca_hooks_result_candidates(
     model_name: str, concept: str, vector_type: str, is_remove: bool
 ) -> list[str]:
-    suffix = "_remove" if is_remove else ""
     base_dir = f"assets/linear/{model_name}"
 
-    tagged_pattern = f"{base_dir}/pca_hooks_{concept}_{vector_type}_cfg_*{suffix}.pt"
+    tagged_pattern = f"{base_dir}/pca_hooks_{concept}_{vector_type}_*.pt"
     tagged_paths = [path for path in glob(tagged_pattern) if os.path.isfile(path)]
+    if is_remove:
+        tagged_paths = [path for path in tagged_paths if path.endswith("_remove.pt")]
+    else:
+        tagged_paths = [
+            path for path in tagged_paths if not path.endswith("_remove.pt")
+        ]
     tagged_paths.sort(key=os.path.getmtime, reverse=True)
 
     legacy_path = _pca_hooks_result_path(model_name, concept, vector_type, is_remove)
