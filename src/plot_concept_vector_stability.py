@@ -15,119 +15,112 @@ from utils import (
 )
 
 
-def plot_stability_on_ax(results: dict, concept_name: str, ax) -> None:
-    sizes = [int(s) for s in results.get("token_sizes", results["example_sizes"])]
-    sizes = sorted(sizes)
+def _extract_layer_series(
+    results: dict,
+) -> tuple[list[int], list[int], np.ndarray]:
+    sizes = sorted(int(s) for s in results.get("token_sizes", results["example_sizes"]))
+    layers = results["layers"]
 
-    means = []
-    stds = []
-    for size in sizes:
+    means = np.zeros((len(layers), len(sizes)), dtype=float)
+    for size_idx, size in enumerate(sizes):
         metrics = results["metrics"][str(size)]["cosine_to_reference"]
-        means.append(metrics["mean"])
-        stds.append(metrics["std"])
+        means[:, size_idx] = np.asarray(metrics["per_layer_mean"], dtype=float)
 
-    ax.plot(sizes, means, marker="o", linewidth=2, color="#1f77b4")
-    means_arr = np.asarray(means)
-    stds_arr = np.asarray(stds)
-    ax.fill_between(
-        sizes,
-        means_arr - stds_arr,
-        means_arr + stds_arr,
-        alpha=0.2,
-        color="#1f77b4",
-    )
-    ax.set_xscale("log")
-    ax.set_xlabel("Number of tokens")
-    ax.set_ylabel("Cosine similarity to reference")
-    ax.set_title(f"Stability vs. token budget: {concept_name}")
-    ax.grid(True, linestyle="--", alpha=0.6)
-
-    reference_size = results.get("reference_size")
-    if reference_size is not None and reference_size < 0:
-        reference_tokens = results.get("reference_tokens", {}).get("total_tokens")
-        if reference_tokens is not None:
-            ax.text(
-                0.02,
-                0.98,
-                f"ref=all ({reference_tokens} tokens)",
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=10,
-                color="#444444",
-            )
-
-    max_size = sizes[-1]
-    max_mean = means[-1]
-    ax.scatter([max_size], [max_mean], color="#d62728", zorder=3)
-    ax.annotate(
-        f"max={max_size}",
-        xy=(max_size, max_mean),
-        xytext=(8, 8),
-        textcoords="offset points",
-        fontsize=10,
-        color="#d62728",
-    )
+    return sizes, layers, means
 
 
-def plot_stability(results: dict, model_name: str, concept_name: str) -> None:
-    plot_config = build_plot_config(
-        {
-            "figsize": (10, 6),
-            "rc_params": {"axes.titlesize": 16, "axes.labelsize": 14},
-        }
-    )
-    apply_plot_style(plot_config["style"], plot_config["rc_params"])
-
-    os.makedirs("plots", exist_ok=True)
-    fig, ax = plt.subplots(figsize=plot_config["figsize"])
-    plot_stability_on_ax(results, concept_name, ax)
-    plot_path = os.path.join("plots", f"stability_{model_name}_{concept_name}.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_stability_grid(results_by_concept: dict, model_name: str) -> None:
-    plot_config = build_plot_config(
-        {
-            "figsize": (12, 8),
-            "rc_params": {"axes.titlesize": 14, "axes.labelsize": 12},
-        }
-    )
-    apply_plot_style(plot_config["style"], plot_config["rc_params"])
-
+def plot_model_layer_stability(
+    results_by_concept: dict,
+    model_name: str,
+    concept_scope: str,
+) -> None:
     concepts = list(results_by_concept.keys())
-    total = len(concepts)
-    if total == 0:
+    if not concepts:
         return
 
-    ncols = 2 if total > 1 else 1
-    nrows = math.ceil(total / ncols)
+    plot_config = build_plot_config(
+        {
+            "figsize": (16, 10),
+            "rc_params": {"axes.titlesize": 12, "axes.labelsize": 10},
+        }
+    )
+    apply_plot_style(plot_config["style"], plot_config["rc_params"])
+
+    series_by_concept = {}
+    layer_ids = None
+    for concept_name in concepts:
+        sizes, layers, means = _extract_layer_series(results_by_concept[concept_name])
+        if layer_ids is None:
+            layer_ids = layers
+        elif layers != layer_ids:
+            raise ValueError(
+                f"Layer mismatch for concept {concept_name}. Expected {layer_ids}, got {layers}"
+            )
+        series_by_concept[concept_name] = {
+            "sizes": sizes,
+            "means": means,
+        }
+
+    total_layers = len(layer_ids)
+    ncols = min(4, max(1, math.ceil(math.sqrt(total_layers))))
+    nrows = math.ceil(total_layers / ncols)
+
     fig, axes = plt.subplots(
         nrows=nrows,
         ncols=ncols,
-        figsize=(6 * ncols, 4 * nrows),
+        figsize=(4.5 * ncols, 3.2 * nrows),
         squeeze=False,
     )
 
-    for idx, concept_name in enumerate(concepts):
-        row = idx // ncols
-        col = idx % ncols
-        plot_stability_on_ax(
-            results_by_concept[concept_name], concept_name, axes[row][col]
-        )
+    for layer_pos, layer_idx in enumerate(layer_ids):
+        row = layer_pos // ncols
+        col = layer_pos % ncols
+        ax = axes[row][col]
 
-    for idx in range(total, nrows * ncols):
+        for concept_name in concepts:
+            series = series_by_concept[concept_name]
+            sizes = series["sizes"]
+            means = series["means"][layer_pos]
+
+            ax.plot(
+                sizes,
+                means,
+                marker="o",
+                linewidth=1.8,
+                markersize=4,
+                label=concept_name,
+            )
+
+        ax.set_xscale("log")
+        ax.set_title(f"Layer {layer_idx}")
+        ax.grid(True, linestyle="--", alpha=0.6)
+
+    for idx in range(total_layers, nrows * ncols):
         row = idx // ncols
         col = idx % ncols
         axes[row][col].axis("off")
 
-    fig.suptitle(f"Stability vs. token budget: {model_name}", fontsize=16)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=min(4, len(labels)),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.suptitle(
+        f"Concept vector stability by layer: {model_name}", fontsize=14, y=1.02
+    )
+    fig.supxlabel("Number of tokens")
+    fig.supylabel("Cosine similarity to reference")
+
     os.makedirs("plots", exist_ok=True)
-    plot_path = os.path.join("plots", f"stability_{model_name}_all.png")
-    fig.savefig(plot_path, dpi=200)
+    plot_path = os.path.join(
+        "plots", f"stability_{model_name}_{concept_scope}_by_layer.png"
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(plot_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -187,15 +180,14 @@ def main() -> None:
             model_name, concept_category
         )
 
-    for concept_category in concept_categories:
-        plot_stability(
-            results_by_concept[concept_category],
-            model_name=model_name,
-            concept_name=concept_category,
-        )
-
-    if len(concept_categories) > 1:
-        plot_stability_grid(results_by_concept, model_name=model_name)
+    concept_scope = (
+        "all_concepts" if args.concept_category == "all" else args.concept_category
+    )
+    plot_model_layer_stability(
+        results_by_concept,
+        model_name=model_name,
+        concept_scope=concept_scope,
+    )
 
 
 if __name__ == "__main__":
