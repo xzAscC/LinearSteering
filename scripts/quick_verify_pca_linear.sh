@@ -45,8 +45,10 @@ echo "[3/3] Print compact comparison"
 VERIFY_MODEL="$MODEL" VERIFY_CONCEPT="$CONCEPT" uv run python - <<'PY'
 import glob
 import os
+import sys
 import torch
 
+sys.path.append("src")
 from utils import get_model_name_for_path
 
 model = os.environ["VERIFY_MODEL"]
@@ -58,7 +60,7 @@ base = f"assets/linear/{model_name}"
 
 def latest_result_path(is_remove: bool) -> str:
     suffix = "_remove" if is_remove else ""
-    tagged_pattern = f"{base}/pca_hooks_{concept}_{vector_type}_cfg_*{suffix}.pt"
+    tagged_pattern = f"{base}/pca_hooks_{concept}_{vector_type}_*cfg_*{suffix}.pt"
     tagged_paths = sorted(glob.glob(tagged_pattern), key=os.path.getmtime, reverse=True)
     if tagged_paths:
         return tagged_paths[0]

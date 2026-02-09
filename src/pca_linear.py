@@ -387,6 +387,25 @@ def _build_run_tag(
     hook_points: list[str],
     args,
 ) -> str:
+    def _compact_layer_tag(layer_indices: list[int]) -> str:
+        unique_sorted = sorted(set(layer_indices))
+        if not unique_sorted:
+            return "none"
+        if len(unique_sorted) <= 8:
+            return "_".join(str(idx) for idx in unique_sorted)
+        return f"{unique_sorted[0]}to{unique_sorted[-1]}x{len(unique_sorted)}"
+
+    def _compact_hook_tag(points: list[str]) -> str:
+        unique_points = []
+        for point in points:
+            if point not in unique_points:
+                unique_points.append(point)
+        if not unique_points:
+            return "none"
+        if len(unique_points) <= 5:
+            return "-".join(unique_points)
+        return f"{unique_points[0]}-{unique_points[1]}-x{len(unique_points)}"
+
     run_config = {
         "steer_layer_idx": steer_layer_idx,
         "layers_to_run": layers_to_run,
@@ -400,7 +419,9 @@ def _build_run_tag(
     }
     config_json = json.dumps(run_config, sort_keys=True)
     config_hash = hashlib.md5(config_json.encode()).hexdigest()[:10]
-    return f"cfg_{config_hash}"
+    layer_tag = _compact_layer_tag(layers_to_run)
+    hook_tag = _compact_hook_tag(hook_points)
+    return f"s{steer_layer_idx}_l{layer_tag}_h{hook_tag}_cfg_{config_hash}"
 
 
 def _prepare_input_ids(
