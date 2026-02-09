@@ -20,11 +20,12 @@ Common Commands
 - Install dependencies: `uv sync`
 - Concept vectors: `uv run python src/extract_concepts.py --model Qwen/Qwen3-1.7B --concept_category steering_detectable_format_json_format`
 - PCA linearity sweep: `uv run python src/pca_linear.py --model Qwen/Qwen3-1.7B --layers 0,6,13,20,27`
-- Plot results: `uv run python src/plot_linear.py` or `uv run python src/plot_linear_n95.py`
+- Plot results: `uv run python src/plot/plot_linear.py` or `uv run python src/plot/plot_linear_n95.py`
 - Steering probe (custom): `uv run python src/steering_linear_probe.py`
 
 Repository Layout
 - `src/`: research scripts and utilities
+- `tests/`: pytest suite covering scripts and plotting helpers
 - `assets/`: concept vectors, linearity results, and derived artifacts
 - `dataset/`: prompt datasets (JSONL)
 - `logs/`, `plots/`: outputs from analysis scripts
@@ -105,5 +106,5 @@ Missing Rules
 - If these files are added later, update this document to include their guidance.
 
 Notes
-- README is currently minimal; do not assume additional workflow steps beyond scripts.
-- There is no formal test suite; validate changes by running the relevant scripts.
+- Use `README.md` for high-level project setup and common workflows.
+- There is a pytest suite in `tests/`; run the most relevant tests for touched code.

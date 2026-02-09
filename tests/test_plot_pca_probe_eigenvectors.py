@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-import plot_pca_probe_eigenvectors
+from plot import plot_pca_probe_eigenvectors
 
 
 def test_main_runs_with_minimal_assets(tmp_path, monkeypatch) -> None:

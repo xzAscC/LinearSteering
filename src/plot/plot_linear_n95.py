@@ -1,5 +1,13 @@
+# ruff: noqa: E402
+
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
+import sys
+
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from utils import (
     apply_plot_style,

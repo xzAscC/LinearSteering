@@ -1,20 +1,28 @@
+# ruff: noqa: E402
+
 import argparse
 import glob
 import os
+from pathlib import Path
+import sys
 
 from loguru import logger
 
-from plot_probe_utils import compute_max_cosine_matrix
-from plot_probe_utils import find_probe_layers
-from plot_probe_utils import load_components_for_steer_layer
-from plot_probe_utils import parse_optional_layers
-from plot_probe_utils import plot_cosine_heatmap
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from plot.plot_probe_utils import compute_cosine_similarity
+from plot.plot_probe_utils import find_probe_layers
+from plot.plot_probe_utils import load_probe_weights_for_steer_layer
+from plot.plot_probe_utils import parse_optional_layers
+from plot.plot_probe_utils import plot_cosine_heatmap
 from utils import get_model_name_for_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot max cosine similarity for PCA eigenvectors across alphas"
+        description="Plot cosine similarity heatmaps for linear probe weights"
     )
     parser.add_argument(
         "--model",
@@ -43,14 +51,14 @@ def main() -> None:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="plots/pca_probe_eigenvectors",
+        default="plots/linear_probe_weights",
     )
     args = parser.parse_args()
 
     model_name = get_model_name_for_path(args.model)
-    weight_root = os.path.join("assets", "pca_probe", model_name, "probe_components")
+    weight_root = os.path.join("assets", "linear_probe", model_name, "probe_weights")
     if not os.path.isdir(weight_root):
-        raise FileNotFoundError(f"Probe components directory not found: {weight_root}")
+        raise FileNotFoundError(f"Probe weights directory not found: {weight_root}")
 
     if args.concepts:
         concepts = [c.strip() for c in args.concepts.split(",") if c.strip()]
@@ -105,19 +113,20 @@ def main() -> None:
                 continue
 
             for probe_layer in probe_layers:
-                labels, components_list = load_components_for_steer_layer(
+                labels, weights = load_probe_weights_for_steer_layer(
                     steer_dir,
                     probe_layer,
+                    prefer_raw_weight=True,
                 )
                 if not labels:
                     logger.warning(
-                        "No components found for concept {} steer {} probe {}",
+                        "No weights found for concept {} steer {} probe {}",
                         concept,
                         steer_layer,
                         probe_layer,
                     )
                     continue
-                cosine = compute_max_cosine_matrix(components_list)
+                cosine = compute_cosine_similarity(weights)
                 output_path = os.path.join(
                     args.output_dir,
                     model_name,
@@ -129,12 +138,10 @@ def main() -> None:
                     cosine,
                     labels,
                     title=(
-                        f"PCA eigenvector max cosine ({concept}) {steer_name} "
+                        f"Probe weight cosine ({concept}) {steer_name} "
                         f"probe{probe_layer}"
                     ),
                     output_path=output_path,
-                    xlabel="Alpha index",
-                    ylabel="Alpha index",
                 )
 
 

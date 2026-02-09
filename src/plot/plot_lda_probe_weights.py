@@ -1,14 +1,22 @@
+# ruff: noqa: E402
+
 import argparse
 import glob
 import os
+from pathlib import Path
+import sys
 
 from loguru import logger
 
-from plot_probe_utils import compute_cosine_similarity
-from plot_probe_utils import find_probe_layers
-from plot_probe_utils import load_probe_weights_for_steer_layer
-from plot_probe_utils import parse_optional_layers
-from plot_probe_utils import plot_cosine_heatmap
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from plot.plot_probe_utils import compute_cosine_similarity
+from plot.plot_probe_utils import find_probe_layers
+from plot.plot_probe_utils import load_probe_weights_for_steer_layer
+from plot.plot_probe_utils import parse_optional_layers
+from plot.plot_probe_utils import plot_cosine_heatmap
 from utils import get_model_name_for_path
 
 

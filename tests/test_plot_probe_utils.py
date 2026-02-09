@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
-
 import torch
 
-import plot_probe_utils
+from plot import plot_probe_utils
 
 
 def test_weight_label_from_payload() -> None:
