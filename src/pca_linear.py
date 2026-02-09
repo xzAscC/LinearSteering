@@ -1,4 +1,7 @@
 import argparse
+import faulthandler
+import hashlib
+import json
 import os
 import torch
 import transformers
@@ -23,13 +26,16 @@ class PCAStatisticsAggregator:
     Computes global mean and std from online updates of sum and sum_sq.
     """
 
-    def __init__(self):
+    def __init__(self, token_chunk_size: int = 32):
+        if token_chunk_size <= 0:
+            raise ValueError("token_chunk_size must be positive")
         self.score_sum = 0.0
         self.score_sq_sum = 0.0
         self.n95_sum = 0.0
         self.n95_sq_sum = 0.0
         self.count = 0
         self.degenerate_count = 0
+        self.token_chunk_size = token_chunk_size
 
     def update(self, trajectory_data):
         """
@@ -41,44 +47,50 @@ class PCAStatisticsAggregator:
         # [Steps, N_tokens, Hidden] -> [N_tokens, Steps, Hidden]
         X = trajectory_data.permute(1, 0, 2).float()
 
-        # Center each trajectory independently
-        X_mean = X.mean(dim=1, keepdim=True)
-        X_centered = X - X_mean
-
-        # Compute SVD for each sample
-        # S has shape [N, min(T, D)]
-        S = torch.linalg.svdvals(X_centered)
-
-        eigenvalues = S**2
-        total_variance = eigenvalues.sum(dim=-1)
-
-        # Avoid division by zero
         epsilon = 1e-12
-        valid_mask = total_variance > epsilon
+        total_tokens = X.shape[0]
 
-        valid_count = int(valid_mask.sum().item())
-        self.degenerate_count += int((~valid_mask).sum().item())
-        if valid_count == 0:
-            return
+        for start in range(0, total_tokens, self.token_chunk_size):
+            end = min(start + self.token_chunk_size, total_tokens)
+            X_chunk = X[start:end]
 
-        valid_eigenvars = eigenvalues[valid_mask]
-        valid_total = total_variance[valid_mask]
+            # Center each trajectory independently
+            X_mean = X_chunk.mean(dim=1, keepdim=True)
+            X_centered = X_chunk - X_mean
 
-        # 1. Linearity score (PC1 / Total)
-        scores = valid_eigenvars[:, 0] / valid_total
+            # Compute SVD for each sample
+            # S has shape [N_chunk, min(T, D)]
+            S = torch.linalg.svdvals(X_centered)
 
-        # 2. n_95
-        ratios = valid_eigenvars / valid_total.unsqueeze(-1)
-        cumsum = torch.cumsum(ratios, dim=-1)
-        # Count components needed to reach >= 0.95
-        n_95 = (cumsum < 0.95).sum(dim=-1).float() + 1.0
+            eigenvalues = S**2
+            total_variance = eigenvalues.sum(dim=-1)
 
-        # Update aggregators with valid trajectories only
-        self.score_sum += scores.sum().item()
-        self.score_sq_sum += (scores**2).sum().item()
-        self.n95_sum += n_95.sum().item()
-        self.n95_sq_sum += (n_95**2).sum().item()
-        self.count += valid_count
+            # Avoid division by zero
+            valid_mask = total_variance > epsilon
+
+            valid_count = int(valid_mask.sum().item())
+            self.degenerate_count += int((~valid_mask).sum().item())
+            if valid_count == 0:
+                continue
+
+            valid_eigenvars = eigenvalues[valid_mask]
+            valid_total = total_variance[valid_mask]
+
+            # 1. Linearity score (PC1 / Total)
+            scores = valid_eigenvars[:, 0] / valid_total
+
+            # 2. n_95
+            ratios = valid_eigenvars / valid_total.unsqueeze(-1)
+            cumsum = torch.cumsum(ratios, dim=-1)
+            # Count components needed to reach >= 0.95
+            n_95 = (cumsum < 0.95).sum(dim=-1).float() + 1.0
+
+            # Update aggregators with valid trajectories only
+            self.score_sum += scores.sum().item()
+            self.score_sq_sum += (scores**2).sum().item()
+            self.n95_sum += n_95.sum().item()
+            self.n95_sq_sum += (n_95**2).sum().item()
+            self.count += valid_count
 
     def finalize(self):
         if self.count == 0:
@@ -219,17 +231,23 @@ def _parse_hook_points(hook_points_arg: str) -> list[str]:
 
 def _parse_concepts_to_run(concepts_arg: str) -> list[tuple[str, dict]]:
     if concepts_arg.strip().lower() == "all":
-        return list(CONCEPT_CATEGORIES.items())
+        all_concepts = list(CONCEPT_CATEGORIES.items())
+        all_concepts.append((RANDOM_DIRECTION_CONCEPT, {}))
+        return all_concepts
 
     selected_concepts: list[str] = []
     for raw_concept in concepts_arg.split(","):
         concept_name = raw_concept.strip()
         if not concept_name:
             continue
+        if concept_name == RANDOM_DIRECTION_CONCEPT:
+            if concept_name not in selected_concepts:
+                selected_concepts.append(concept_name)
+            continue
         if concept_name not in CONCEPT_CATEGORIES:
             raise ValueError(
                 f"Unknown concept '{concept_name}'. "
-                f"Available: {sorted(CONCEPT_CATEGORIES.keys())}"
+                f"Available: {sorted([*CONCEPT_CATEGORIES.keys(), RANDOM_DIRECTION_CONCEPT])}"
             )
         if concept_name not in selected_concepts:
             selected_concepts.append(concept_name)
@@ -237,7 +255,13 @@ def _parse_concepts_to_run(concepts_arg: str) -> list[tuple[str, dict]]:
     if not selected_concepts:
         raise ValueError("No valid concepts were provided.")
 
-    return [(name, CONCEPT_CATEGORIES[name]) for name in selected_concepts]
+    concept_items: list[tuple[str, dict]] = []
+    for name in selected_concepts:
+        if name == RANDOM_DIRECTION_CONCEPT:
+            concept_items.append((name, {}))
+        else:
+            concept_items.append((name, CONCEPT_CATEGORIES[name]))
+    return concept_items
 
 
 def _resolve_hook_module(layer_module, hook_point: str):
@@ -355,6 +379,28 @@ def _capture_occurs_after_steering(
     if hook_point != "block_out":
         return False
     return target_layer_idx >= steer_layer_idx
+
+
+def _build_run_tag(
+    steer_layer_idx: int,
+    layers_to_run: list[int],
+    hook_points: list[str],
+    args,
+) -> str:
+    run_config = {
+        "steer_layer_idx": steer_layer_idx,
+        "layers_to_run": layers_to_run,
+        "hook_points": hook_points,
+        "alpha_min": args.alpha_min,
+        "alpha_max": args.alpha_max,
+        "alpha_points": args.alpha_points,
+        "test_size": args.test_size,
+        "max_tokens": args.max_tokens,
+        "remove_concept_vector": args.remove_concept_vector,
+    }
+    config_json = json.dumps(run_config, sort_keys=True)
+    config_hash = hashlib.md5(config_json.encode()).hexdigest()[:10]
+    return f"cfg_{config_hash}"
 
 
 def _prepare_input_ids(
@@ -512,6 +558,14 @@ def run_model_analysis(model_full_name, args, max_layers):
         logger.error(f"No valid (layer, hook_point) targets for model {model_name}.")
         return
 
+    run_tag = _build_run_tag(
+        steer_layer_idx=steer_layer_idx,
+        layers_to_run=layers_to_run,
+        hook_points=hook_points,
+        args=args,
+    )
+    logger.info(f"Run tag: {run_tag}")
+
     concept_items = _parse_concepts_to_run(args.concepts)
 
     def _run_single_vector_analysis(
@@ -536,87 +590,100 @@ def run_model_analysis(model_full_name, args, max_layers):
 
         for target in iterator:
             layer_idx, hook_point = target
-
-            aggregator = PCAStatisticsAggregator()
-
-            # Process in batches of prompts to save memory
-            batch_size = 1  # Process one prompt (or small batch) at a time
-
-            # Split input_ids into chunks
-            total_prompts = input_ids.shape[0]
-
-            for i in range(0, total_prompts, batch_size):
-                input_ids_batch = input_ids[i : i + batch_size]
-                attention_mask_batch = attention_mask[i : i + batch_size]
-
-                batch_collected_deltas = []
-
-                h_ref_batch = _run_with_steering_and_capture(
-                    model=model_obj,
-                    input_ids=input_ids_batch,
-                    attention_mask=attention_mask_batch,
-                    steering_vector=steering_vector,
-                    alpha_value=0.0,
-                    steer_layer_idx=steer_layer_idx,
-                    target_layer_idx=layer_idx,
-                    hook_point=hook_point,
-                    device=device,
-                )
-                h_ref_flat_batch = _hidden_to_flat_with_attention_mask(
-                    h_ref_batch,
-                    target_dtype=torch.float32,
-                    attention_mask=attention_mask_batch,
+            try:
+                aggregator = PCAStatisticsAggregator(
+                    token_chunk_size=args.pca_token_chunk
                 )
 
-                if 0.0 not in alphas:
-                    batch_collected_deltas.append(torch.zeros_like(h_ref_flat_batch))
+                # Process in batches of prompts to save memory
+                batch_size = 1  # Process one prompt (or small batch) at a time
 
-                for alpha in alphas:
-                    h_batch = _run_with_steering_and_capture(
+                # Split input_ids into chunks
+                total_prompts = input_ids.shape[0]
+
+                for i in range(0, total_prompts, batch_size):
+                    input_ids_batch = input_ids[i : i + batch_size]
+                    attention_mask_batch = attention_mask[i : i + batch_size]
+
+                    batch_collected_deltas = []
+
+                    h_ref_batch = _run_with_steering_and_capture(
                         model=model_obj,
                         input_ids=input_ids_batch,
                         attention_mask=attention_mask_batch,
                         steering_vector=steering_vector,
-                        alpha_value=alpha,
+                        alpha_value=0.0,
                         steer_layer_idx=steer_layer_idx,
                         target_layer_idx=layer_idx,
                         hook_point=hook_point,
                         device=device,
                     )
-
-                    if args.remove_concept_vector and _capture_occurs_after_steering(
-                        target_layer_idx=layer_idx,
-                        hook_point=hook_point,
-                        steer_layer_idx=steer_layer_idx,
-                    ):
-                        steering_vec_device = steering_vector.to(
-                            device=h_batch.device, dtype=h_batch.dtype
-                        )
-                        h_batch = h_batch - alpha * steering_vec_device
-
-                    h_flat = _hidden_to_flat_with_attention_mask(
-                        h_batch,
-                        attention_mask=attention_mask_batch,
+                    h_ref_flat_batch = _hidden_to_flat_with_attention_mask(
+                        h_ref_batch,
                         target_dtype=torch.float32,
+                        attention_mask=attention_mask_batch,
                     )
-                    delta = h_flat - h_ref_flat_batch
 
-                    batch_collected_deltas.append(delta)
+                    if 0.0 not in alphas:
+                        batch_collected_deltas.append(
+                            torch.zeros_like(h_ref_flat_batch)
+                        )
 
-                # Stack deltas for this batch [N_steps, N_tokens_in_batch, Hidden]
-                batch_trajectory = torch.stack(batch_collected_deltas)
+                    for alpha in alphas:
+                        h_batch = _run_with_steering_and_capture(
+                            model=model_obj,
+                            input_ids=input_ids_batch,
+                            attention_mask=attention_mask_batch,
+                            steering_vector=steering_vector,
+                            alpha_value=alpha,
+                            steer_layer_idx=steer_layer_idx,
+                            target_layer_idx=layer_idx,
+                            hook_point=hook_point,
+                            device=device,
+                        )
 
-                # Update aggregator
-                aggregator.update(batch_trajectory)
+                        if (
+                            args.remove_concept_vector
+                            and _capture_occurs_after_steering(
+                                target_layer_idx=layer_idx,
+                                hook_point=hook_point,
+                                steer_layer_idx=steer_layer_idx,
+                            )
+                        ):
+                            steering_vec_device = steering_vector.to(
+                                device=h_batch.device, dtype=h_batch.dtype
+                            )
+                            h_batch = h_batch - alpha * steering_vec_device
 
-                del (
-                    batch_trajectory,
-                    batch_collected_deltas,
-                    h_ref_batch,
-                    h_ref_flat_batch,
+                        h_flat = _hidden_to_flat_with_attention_mask(
+                            h_batch,
+                            attention_mask=attention_mask_batch,
+                            target_dtype=torch.float32,
+                        )
+                        delta = h_flat - h_ref_flat_batch
+
+                        batch_collected_deltas.append(delta)
+
+                    # Stack deltas for this batch [N_steps, N_tokens_in_batch, Hidden]
+                    batch_trajectory = torch.stack(batch_collected_deltas)
+
+                    # Update aggregator
+                    aggregator.update(batch_trajectory)
+
+                    del (
+                        batch_trajectory,
+                        batch_collected_deltas,
+                        h_ref_batch,
+                        h_ref_flat_batch,
+                    )
+
+                stats = aggregator.finalize()
+            except Exception:
+                logger.exception(
+                    f"Failed target for {concept_name} ({vector_type}) at "
+                    f"layer {layer_idx}, hook {hook_point}"
                 )
-
-            stats = aggregator.finalize()
+                raise
 
             if layer_idx not in results:
                 results[layer_idx] = {}
@@ -644,13 +711,14 @@ def run_model_analysis(model_full_name, args, max_layers):
         suffix = "_remove" if args.remove_concept_vector else ""
         save_path = (
             f"assets/linear/{model_name}/"
-            f"pca_hooks_{concept_name}_{vector_type}{suffix}.pt"
+            f"pca_hooks_{concept_name}_{vector_type}_{run_tag}{suffix}.pt"
         )
         torch.save(
             {
                 "model": model_full_name,
                 "concept_category": concept_name,
                 "vector_type": vector_type,
+                "run_tag": run_tag,
                 "steer_layer_idx": steer_layer_idx,
                 "hook_points": hook_points,
                 "layers": layers_to_run,
@@ -662,6 +730,46 @@ def run_model_analysis(model_full_name, args, max_layers):
 
     for concept_category_name, concept_category_config in concept_items:
         logger.info(f"Processing {concept_category_name}")
+
+        if concept_category_name == RANDOM_DIRECTION_CONCEPT:
+            safety_config = CONCEPT_CATEGORIES[RANDOM_DIRECTION_DATASET_CONCEPT]
+            positive_dataset, _, dataset_key = load_concept_datasets(
+                RANDOM_DIRECTION_DATASET_CONCEPT, safety_config
+            )
+            input_ids, attention_mask = _prepare_input_ids(
+                tokenizer=tokenizer,
+                positive_dataset=positive_dataset,
+                dataset_key=dataset_key,
+                test_size=args.test_size,
+                max_tokens=args.max_tokens,
+                device=device,
+            )
+
+            random_vector_dir = f"assets/linear/{model_name}/random_vectors"
+            os.makedirs(random_vector_dir, exist_ok=True)
+            random_vector_path = f"{random_vector_dir}/{RANDOM_DIRECTION_CONCEPT}.pt"
+
+            vector_dim = getattr(model.config, "hidden_size")
+            if os.path.exists(random_vector_path):
+                random_vector_data = torch.load(random_vector_path)
+                if isinstance(random_vector_data, dict):
+                    random_vector = random_vector_data["random_vector"]
+                else:
+                    random_vector = random_vector_data
+            else:
+                random_vector = torch.randn(vector_dim, dtype=torch.float32)
+                random_vector = random_vector / random_vector.norm()
+                torch.save({"random_vector": random_vector}, random_vector_path)
+
+            _run_single_vector_analysis(
+                model_obj=model,
+                concept_name=RANDOM_DIRECTION_CONCEPT,
+                vector_type="random",
+                steering_vector=random_vector,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            continue
 
         concept_vectors_path = (
             f"assets/concept_vectors/{model_name}/{concept_category_name}.pt"
@@ -697,48 +805,6 @@ def run_model_analysis(model_full_name, args, max_layers):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-
-    logger.info(
-        "Processing random direction once using the steering_safety dataset "
-        "(treated as a standalone concept)."
-    )
-    safety_config = CONCEPT_CATEGORIES[RANDOM_DIRECTION_DATASET_CONCEPT]
-    positive_dataset, _, dataset_key = load_concept_datasets(
-        RANDOM_DIRECTION_DATASET_CONCEPT, safety_config
-    )
-    input_ids, attention_mask = _prepare_input_ids(
-        tokenizer=tokenizer,
-        positive_dataset=positive_dataset,
-        dataset_key=dataset_key,
-        test_size=args.test_size,
-        max_tokens=args.max_tokens,
-        device=device,
-    )
-
-    random_vector_dir = f"assets/linear/{model_name}/random_vectors"
-    os.makedirs(random_vector_dir, exist_ok=True)
-    random_vector_path = f"{random_vector_dir}/{RANDOM_DIRECTION_CONCEPT}.pt"
-
-    vector_dim = getattr(model.config, "hidden_size")
-    if os.path.exists(random_vector_path):
-        random_vector_data = torch.load(random_vector_path)
-        if isinstance(random_vector_data, dict):
-            random_vector = random_vector_data["random_vector"]
-        else:
-            random_vector = random_vector_data
-    else:
-        random_vector = torch.randn(vector_dim, dtype=torch.float32)
-        random_vector = random_vector / random_vector.norm()
-        torch.save({"random_vector": random_vector}, random_vector_path)
-
-    _run_single_vector_analysis(
-        model_obj=model,
-        concept_name=RANDOM_DIRECTION_CONCEPT,
-        vector_type="random",
-        steering_vector=random_vector,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-    )
 
     del model
     del tokenizer
@@ -815,10 +881,20 @@ def main():
         default=True,
         help="Remove concept vector from hidden states (default: true)",
     )
+    parser.add_argument(
+        "--pca_token_chunk",
+        type=int,
+        default=32,
+        help=(
+            "Number of token trajectories processed per SVD call. "
+            "Lower this if the process exits unexpectedly (possible OOM)."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs("logs", exist_ok=True)
     logger.add("logs/linear.log")
+    faulthandler.enable()
     logger.info(f"args: {args}")
     set_seed(args.seed)
 

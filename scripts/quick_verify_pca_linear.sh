@@ -6,6 +6,7 @@ set -euo pipefail
 #   bash scripts/quick_verify_pca_linear.sh
 # Optional env overrides:
 #   MODEL=Qwen/Qwen3-1.7B CONCEPT=steering_safety STEER_LAYER=0
+#   MODEL=Qwen/Qwen3-1.7B CONCEPT=steering_random_direction STEER_LAYER=0
 
 MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 CONCEPT="${CONCEPT:-steering_safety}"
@@ -42,6 +43,7 @@ uv run python src/pca_linear.py \
 
 echo "[3/3] Print compact comparison"
 VERIFY_MODEL="$MODEL" VERIFY_CONCEPT="$CONCEPT" uv run python - <<'PY'
+import glob
 import os
 import torch
 
@@ -50,10 +52,22 @@ from utils import get_model_name_for_path
 model = os.environ["VERIFY_MODEL"]
 concept = os.environ["VERIFY_CONCEPT"]
 model_name = get_model_name_for_path(model)
+vector_type = "random" if concept == "steering_random_direction" else "concept"
 
 base = f"assets/linear/{model_name}"
-remove_path = f"{base}/pca_hooks_{concept}_concept_remove.pt"
-keep_path = f"{base}/pca_hooks_{concept}_concept.pt"
+
+def latest_result_path(is_remove: bool) -> str:
+    suffix = "_remove" if is_remove else ""
+    tagged_pattern = f"{base}/pca_hooks_{concept}_{vector_type}_cfg_*{suffix}.pt"
+    tagged_paths = sorted(glob.glob(tagged_pattern), key=os.path.getmtime, reverse=True)
+    if tagged_paths:
+        return tagged_paths[0]
+
+    legacy_path = f"{base}/pca_hooks_{concept}_{vector_type}{suffix}.pt"
+    return legacy_path
+
+remove_path = latest_result_path(is_remove=True)
+keep_path = latest_result_path(is_remove=False)
 
 def summarize(path: str):
     data = torch.load(path, map_location="cpu")
