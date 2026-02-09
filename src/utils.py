@@ -474,7 +474,14 @@ def _linearity_result_path(
     return f"assets/linear/{model_name}/linearity_{concept}_{vector_type}{suffix}.pt"
 
 
-def _load_linearity_results(path: str) -> Optional[Dict[str, Any]]:
+def _pca_hooks_result_path(
+    model_name: str, concept: str, vector_type: str, is_remove: bool
+) -> str:
+    suffix = "_remove" if is_remove else ""
+    return f"assets/linear/{model_name}/pca_hooks_{concept}_{vector_type}{suffix}.pt"
+
+
+def _load_result_data(path: str) -> Optional[Dict[str, Any]]:
     if not os.path.exists(path):
         return None
     try:
@@ -483,7 +490,60 @@ def _load_linearity_results(path: str) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(data, dict):
         return None
-    return data.get("results")
+    return data
+
+
+def _extract_layer_stats(
+    value: Any, preferred_hook_points: Optional[list[str]] = None
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+
+    if "mean_score" in value or "n_components_95_mean" in value:
+        return value
+
+    hook_points = preferred_hook_points or []
+    remaining_hook_points = sorted(k for k in value.keys() if isinstance(k, str))
+    ordered_hook_points = hook_points + [
+        hp for hp in remaining_hook_points if hp not in hook_points
+    ]
+
+    for hook_point in ordered_hook_points:
+        hook_stats = value.get(hook_point)
+        if isinstance(hook_stats, dict) and (
+            "mean_score" in hook_stats or "n_components_95_mean" in hook_stats
+        ):
+            return hook_stats
+
+    return None
+
+
+def _load_compatible_linearity_results(
+    model_name: str, concept: str, vector_type: str, is_remove: bool
+) -> Optional[Dict[str, Any]]:
+    old_data = _load_result_data(
+        _linearity_result_path(model_name, concept, vector_type, is_remove)
+    )
+    if old_data and isinstance(old_data.get("results"), dict):
+        return old_data["results"]
+
+    hooks_data = _load_result_data(
+        _pca_hooks_result_path(model_name, concept, vector_type, is_remove)
+    )
+    if not hooks_data or not isinstance(hooks_data.get("results"), dict):
+        return None
+
+    preferred_hook_points = hooks_data.get("hook_points")
+    if not isinstance(preferred_hook_points, list):
+        preferred_hook_points = None
+
+    normalized: Dict[str, Any] = {}
+    for layer_key, value in hooks_data["results"].items():
+        layer_stats = _extract_layer_stats(value, preferred_hook_points)
+        if layer_stats is not None:
+            normalized[layer_key] = layer_stats
+
+    return normalized if normalized else None
 
 
 def _extract_linearity_layers(results: Dict[str, Any]) -> list[int]:
@@ -513,8 +573,9 @@ def load_linearity_scores(
     Returns:
         layers, means, stds, n95_means, n95_stds
     """
-    path = _linearity_result_path(model_name, concept, vector_type, is_remove)
-    results = _load_linearity_results(path)
+    results = _load_compatible_linearity_results(
+        model_name, concept, vector_type, is_remove
+    )
     if not results:
         return None, None, None, None, None
 
@@ -552,8 +613,9 @@ def load_linearity_n95(
     model_name: str, concept: str, vector_type: str, is_remove: bool
 ) -> tuple[Optional[list[int]], Optional[list[float]]]:
     """Load n95 scores for plotting."""
-    path = _linearity_result_path(model_name, concept, vector_type, is_remove)
-    results = _load_linearity_results(path)
+    results = _load_compatible_linearity_results(
+        model_name, concept, vector_type, is_remove
+    )
     if not results:
         return None, None
 
