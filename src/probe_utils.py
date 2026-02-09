@@ -12,6 +12,155 @@ from utils import load_concept_datasets
 from utils import make_steering_hook
 
 
+QWEN3_DEFAULT_CAPTURE_HOOK_POINTS = [
+    "input_ln",
+    "attn",
+    "post_attn_ln",
+    "mlp",
+    "block_out",
+]
+GEMMA2_DEFAULT_CAPTURE_HOOK_POINTS = [
+    "input_ln",
+    "attn",
+    "post_attn_proj_ln",
+    "post_attn_ln",
+    "mlp",
+    "post_mlp_ln",
+    "block_out",
+]
+
+
+def _extract_hidden(output):
+    return output[0] if isinstance(output, tuple) else output
+
+
+def _is_qwen3_style_layer(layer_module) -> bool:
+    return all(
+        hasattr(layer_module, name)
+        for name in (
+            "input_layernorm",
+            "self_attn",
+            "post_attention_layernorm",
+            "mlp",
+        )
+    )
+
+
+def _is_gemma2_style_layer(layer_module) -> bool:
+    return all(
+        hasattr(layer_module, name)
+        for name in (
+            "input_layernorm",
+            "self_attn",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "mlp",
+            "post_feedforward_layernorm",
+        )
+    )
+
+
+def parse_probe_hook_point(hook_point_arg: str) -> str:
+    alias_map = {
+        "ln1": "input_ln",
+        "ln2": "post_attn_ln",
+        "pre_mlp_ln": "post_attn_ln",
+        "pre_ffn_ln": "post_attn_ln",
+        "block": "block_out",
+        "resid": "block_out",
+        "post_attention_ln": "post_attn_proj_ln",
+        "post_attn_norm": "post_attn_proj_ln",
+        "post_ffn_ln": "post_mlp_ln",
+        "post_feedforward_ln": "post_mlp_ln",
+    }
+    valid_points = {
+        "input_ln",
+        "attn",
+        "post_attn_proj_ln",
+        "post_attn_ln",
+        "mlp",
+        "post_mlp_ln",
+        "block_out",
+    }
+
+    normalized = hook_point_arg.strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        raise ValueError("Hook point must be non-empty")
+
+    canonical = alias_map.get(normalized, normalized)
+    if canonical not in valid_points:
+        raise ValueError(
+            f"Unsupported hook point '{hook_point_arg}'. Valid points: {sorted(valid_points)}"
+        )
+    return canonical
+
+
+def parse_probe_hook_points(hook_points_arg: str) -> List[str]:
+    points: List[str] = []
+    for raw_point in hook_points_arg.split(","):
+        raw_point = raw_point.strip()
+        if not raw_point:
+            continue
+        canonical = parse_probe_hook_point(raw_point)
+        if canonical not in points:
+            points.append(canonical)
+
+    if not points:
+        raise ValueError("No valid hook points were provided")
+
+    return points
+
+
+def resolve_default_probe_hook_points(model) -> List[str]:
+    layers_container = _get_layers_container(model)
+    if len(layers_container) > 0 and _is_gemma2_style_layer(layers_container[0]):
+        return GEMMA2_DEFAULT_CAPTURE_HOOK_POINTS.copy()
+    return QWEN3_DEFAULT_CAPTURE_HOOK_POINTS.copy()
+
+
+def resolve_default_probe_hook_point(model) -> str:
+    return resolve_default_probe_hook_points(model)[0]
+
+
+def _resolve_hook_module(layer_module, hook_point: str):
+    if _is_gemma2_style_layer(layer_module):
+        mapping = {
+            "input_ln": layer_module.input_layernorm,
+            "attn": layer_module.self_attn,
+            "post_attn_proj_ln": layer_module.post_attention_layernorm,
+            "post_attn_ln": layer_module.pre_feedforward_layernorm,
+            "mlp": layer_module.mlp,
+            "post_mlp_ln": layer_module.post_feedforward_layernorm,
+            "block_out": layer_module,
+        }
+        if hook_point not in mapping:
+            raise ValueError(
+                f"Hook point '{hook_point}' not supported for Gemma-style layers."
+            )
+        return mapping[hook_point]
+
+    if _is_qwen3_style_layer(layer_module):
+        mapping = {
+            "input_ln": layer_module.input_layernorm,
+            "attn": layer_module.self_attn,
+            "post_attn_ln": layer_module.post_attention_layernorm,
+            "mlp": layer_module.mlp,
+            "block_out": layer_module,
+        }
+        if hook_point not in mapping:
+            raise ValueError(
+                f"Hook point '{hook_point}' not supported for Qwen-style layers."
+            )
+        return mapping[hook_point]
+
+    if hook_point != "block_out":
+        raise ValueError(
+            f"Hook point '{hook_point}' not supported for layer type "
+            f"'{layer_module.__class__.__name__}'. Use 'block_out'."
+        )
+    return layer_module
+
+
 def load_prompts_for_concepts(concepts: List[str], max_prompts: int) -> List[str]:
     prompts: List[str] = []
     for concept in concepts:
@@ -37,6 +186,7 @@ def run_model_capture_layers(
     steering_vector: Optional[torch.Tensor] = None,
     steer_layer: Optional[int] = None,
     alpha: float = 0.0,
+    capture_hook_point: str = "block_out",
 ) -> Dict[int, torch.Tensor]:
     if (steering_vector is None) != (steer_layer is None):
         raise ValueError(
@@ -49,7 +199,7 @@ def run_model_capture_layers(
 
     def make_probe_hook(layer_idx: int):
         def _hook(_module, _inputs, output):
-            hidden = output[0] if isinstance(output, tuple) else output
+            hidden = _extract_hidden(output)
             captured[layer_idx] = hidden.detach()
             return output
 
@@ -63,11 +213,10 @@ def run_model_capture_layers(
         )
 
     for layer_idx in probe_layers:
-        handles.append(
-            layers_container[layer_idx].register_forward_hook(
-                make_probe_hook(layer_idx)
-            )
+        capture_module = _resolve_hook_module(
+            layers_container[layer_idx], capture_hook_point
         )
+        handles.append(capture_module.register_forward_hook(make_probe_hook(layer_idx)))
 
     try:
         with torch.no_grad():
@@ -84,12 +233,14 @@ def run_model_capture_layers_no_steering(
     input_ids: torch.Tensor,
     probe_layers: List[int],
     device: str,
+    capture_hook_point: str = "block_out",
 ) -> Dict[int, torch.Tensor]:
     return run_model_capture_layers(
         model,
         input_ids,
         probe_layers,
         device,
+        capture_hook_point=capture_hook_point,
         steering_vector=None,
         steer_layer=None,
         alpha=0.0,
@@ -103,6 +254,7 @@ def compute_avg_hidden_norm(
     steer_layer: int,
     batch_size: int,
     device: str,
+    capture_hook_point: str = "block_out",
 ) -> float:
     total_norm = 0.0
     total_count = 0
@@ -120,6 +272,7 @@ def compute_avg_hidden_norm(
             inputs.input_ids,
             [steer_layer],
             device,
+            capture_hook_point=capture_hook_point,
         )
         hidden = captured.get(steer_layer)
         if hidden is None:
@@ -194,7 +347,9 @@ def select_steer_layers(max_layers: int, total_layers: int = 6) -> List[int]:
     selected: List[int] = []
     for start, end in segments:
         selected.extend(_pick_segment_layers(start, end, per_segment))
-    selected = sorted(set([l for l in selected if 0 <= l <= last_valid]))
+    selected = sorted(
+        set([layer_idx for layer_idx in selected if 0 <= layer_idx <= last_valid])
+    )
     if len(selected) > total_layers:
         selected = selected[:total_layers]
     return selected

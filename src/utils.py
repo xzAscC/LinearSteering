@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import random
+from glob import glob
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -481,6 +482,23 @@ def _pca_hooks_result_path(
     return f"assets/linear/{model_name}/pca_hooks_{concept}_{vector_type}{suffix}.pt"
 
 
+def _pca_hooks_result_candidates(
+    model_name: str, concept: str, vector_type: str, is_remove: bool
+) -> list[str]:
+    suffix = "_remove" if is_remove else ""
+    base_dir = f"assets/linear/{model_name}"
+
+    tagged_pattern = f"{base_dir}/pca_hooks_{concept}_{vector_type}_cfg_*{suffix}.pt"
+    tagged_paths = [path for path in glob(tagged_pattern) if os.path.isfile(path)]
+    tagged_paths.sort(key=os.path.getmtime, reverse=True)
+
+    legacy_path = _pca_hooks_result_path(model_name, concept, vector_type, is_remove)
+    if os.path.isfile(legacy_path):
+        tagged_paths.append(legacy_path)
+
+    return tagged_paths
+
+
 def _load_result_data(path: str) -> Optional[Dict[str, Any]]:
     if not os.path.exists(path):
         return None
@@ -527,10 +545,16 @@ def _load_compatible_linearity_results(
     if old_data and isinstance(old_data.get("results"), dict):
         return old_data["results"]
 
-    hooks_data = _load_result_data(
-        _pca_hooks_result_path(model_name, concept, vector_type, is_remove)
-    )
-    if not hooks_data or not isinstance(hooks_data.get("results"), dict):
+    hooks_data = None
+    for hooks_path in _pca_hooks_result_candidates(
+        model_name, concept, vector_type, is_remove
+    ):
+        candidate = _load_result_data(hooks_path)
+        if candidate and isinstance(candidate.get("results"), dict):
+            hooks_data = candidate
+            break
+
+    if not hooks_data:
         return None
 
     preferred_hook_points = hooks_data.get("hook_points")
