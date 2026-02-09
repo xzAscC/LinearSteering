@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import json
 import os
+from datetime import datetime
 from typing import Dict, List, Tuple
 
 import torch
@@ -17,11 +19,47 @@ from probe_utils import (
     resolve_default_probe_hook_points,
     run_model_capture_layers,
 )
+from utils import CONCEPT_CATEGORIES
 from utils import MODEL_LAYERS
 from utils import get_model_name_for_path
+from utils import load_concept_datasets
 from utils import parse_layers_to_run
 from utils import seed_from_name
 from utils import set_seed
+
+
+RANDOM_DIRECTION_CONCEPT = "steering_random_direction"
+RANDOM_DIRECTION_DATASET_CONCEPT = "steering_safety"
+
+
+def _parse_concepts_to_run(concepts_arg: str) -> List[str]:
+    selected_concepts: List[str] = []
+    for raw_concept in concepts_arg.split(","):
+        concept_name = raw_concept.strip()
+        if not concept_name:
+            continue
+        if concept_name == RANDOM_DIRECTION_CONCEPT:
+            if concept_name not in selected_concepts:
+                selected_concepts.append(concept_name)
+            continue
+        if concept_name not in CONCEPT_CATEGORIES:
+            raise ValueError(
+                f"Unknown concept '{concept_name}'. "
+                f"Available: {sorted([*CONCEPT_CATEGORIES.keys(), RANDOM_DIRECTION_CONCEPT])}"
+            )
+        if concept_name not in selected_concepts:
+            selected_concepts.append(concept_name)
+
+    if not selected_concepts:
+        raise ValueError("No valid concepts were provided")
+
+    if len(selected_concepts) != 1:
+        raise ValueError(
+            "Please provide exactly one concept direction per run via --concepts. "
+            f"Got: {selected_concepts}"
+        )
+
+    return selected_concepts
 
 
 def train_eval_linear_probe(
@@ -142,6 +180,14 @@ def _resolve_layers_to_run(
     return [layer for layer in layers if layer > min_layer_exclusive]
 
 
+def _build_run_metadata(args: argparse.Namespace) -> Tuple[str, str, str]:
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args_json = json.dumps(vars(args), sort_keys=True, separators=(",", ":"))
+    params_hash = hashlib.sha1(args_json.encode("utf-8")).hexdigest()[:8]
+    run_id = f"{run_timestamp}_s{args.seed}_h{params_hash}"
+    return run_id, run_timestamp, params_hash
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Linear probe before/after steering")
     parser.add_argument(
@@ -153,12 +199,22 @@ def main() -> None:
     parser.add_argument(
         "--concepts",
         type=str,
-        default="steering_detectable_format_json_format,steering_language_response_language,steering_startend_quotation",
+        default="steering_detectable_format_json_format",
+        help=(
+            "Single concept category to process per run. "
+            f"Use '{RANDOM_DIRECTION_CONCEPT}' for a random direction baseline."
+        ),
     )
     parser.add_argument(
+        "--random_direction",
         "--random_directions",
+        dest="random_direction",
         type=str,
-        default="random_direction_1,random_direction_2,random_direction_3",
+        default="random_direction_1",
+        help=(
+            "Random direction vector name under assets/concept_vectors/<model>/ "
+            "used when concepts include steering_random_direction."
+        ),
     )
     parser.add_argument("--alpha_values", type=str, default="1, 10,100,1000,10000")
     parser.add_argument(
@@ -213,6 +269,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    run_id, run_timestamp, params_hash = _build_run_metadata(args)
 
     model_names = [m.strip() for m in args.model.split(",") if m.strip()]
     if not model_names:
@@ -222,20 +279,62 @@ def main() -> None:
         raise ValueError(f"Unknown model(s): {unknown_models}")
 
     set_seed(args.seed)
-    concepts = [c.strip() for c in args.concepts.split(",") if c.strip()]
-    random_dirs = [r.strip() for r in args.random_directions.split(",") if r.strip()]
+    concepts = _parse_concepts_to_run(args.concepts)
+    random_direction_names = [
+        name.strip() for name in args.random_direction.split(",") if name.strip()
+    ]
+    if not random_direction_names:
+        raise ValueError("No random direction provided")
+    if len(random_direction_names) > 1:
+        logger.warning(
+            "Multiple random directions were provided; using the first one: {}",
+            random_direction_names[0],
+        )
+    random_direction_name = random_direction_names[0]
     manual_alpha_values = [
         float(a.strip()) for a in args.alpha_values.split(",") if a.strip()
     ]
     alpha_scales = [float(a.strip()) for a in args.alpha_scales.split(",") if a.strip()]
 
-    prompts = load_prompts_for_concepts(concepts, args.max_prompts)
-    if not prompts:
-        raise RuntimeError("No prompts loaded for selected concepts")
+    concept_prompts: Dict[str, List[str]] = {}
+    for concept in concepts:
+        if concept == RANDOM_DIRECTION_CONCEPT:
+            safety_config = CONCEPT_CATEGORIES[RANDOM_DIRECTION_DATASET_CONCEPT]
+            pos_dataset, neg_dataset, dataset_key = load_concept_datasets(
+                RANDOM_DIRECTION_DATASET_CONCEPT,
+                safety_config,
+            )
+            prompts: List[str] = []
+            for dataset in (pos_dataset, neg_dataset):
+                for item in dataset:
+                    prompts.append(item[dataset_key])
+                    if len(prompts) >= args.max_prompts:
+                        break
+                if len(prompts) >= args.max_prompts:
+                    break
+            concept_prompts[concept] = prompts
+            continue
+
+        prompts = load_prompts_for_concepts([concept], args.max_prompts)
+        concept_prompts[concept] = prompts
+
+    empty_concepts = [
+        concept for concept, prompts in concept_prompts.items() if not prompts
+    ]
+    if empty_concepts:
+        raise RuntimeError(f"No prompts loaded for concepts: {empty_concepts}")
+
+    alpha_reference_prompts: List[str] = []
+    for concept in concepts:
+        alpha_reference_prompts.extend(concept_prompts[concept])
+        if len(alpha_reference_prompts) >= args.max_prompts:
+            alpha_reference_prompts = alpha_reference_prompts[: args.max_prompts]
+            break
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     logger.info(f"Device: {device}")
+    logger.info(f"Run ID: {run_id}")
 
     for model_name_full in model_names:
         max_layers = MODEL_LAYERS[model_name_full]
@@ -282,7 +381,7 @@ def main() -> None:
                     avg_norm = compute_avg_hidden_norm(
                         model,
                         tokenizer,
-                        prompts,
+                        alpha_reference_prompts,
                         steer_layer,
                         args.batch_size,
                         device,
@@ -309,28 +408,33 @@ def main() -> None:
                         alpha_values_by_hook_layer_percent[hook_point][steer_layer],
                     )
 
-        vector_specs: List[Tuple[str, str]] = []
+        vector_specs: List[Tuple[str, str, str, List[str]]] = []
         for concept in concepts:
+            vector_file_stem = (
+                random_direction_name
+                if concept == RANDOM_DIRECTION_CONCEPT
+                else concept
+            )
             vector_specs.append(
                 (
                     concept,
+                    vector_file_stem,
                     os.path.join(
-                        "assets", "concept_vectors", model_name, f"{concept}.pt"
+                        "assets",
+                        "concept_vectors",
+                        model_name,
+                        f"{vector_file_stem}.pt",
                     ),
-                )
-            )
-        for random_dir in random_dirs:
-            vector_specs.append(
-                (
-                    random_dir,
-                    os.path.join(
-                        "assets", "concept_vectors", model_name, f"{random_dir}.pt"
-                    ),
+                    concept_prompts[concept],
                 )
             )
 
-        for vector_name, vector_path in vector_specs:
-            logger.info(f"Processing vector: {vector_name}")
+        for concept_name, vector_name, vector_path, prompts in vector_specs:
+            logger.info(
+                "Processing concept: {} | vector: {}",
+                concept_name,
+                vector_name,
+            )
             vector_tensor = load_vector(vector_path)
             results_by_hook_point = {}
             merged_results_by_hook_point = {}
@@ -467,6 +571,7 @@ def main() -> None:
                                 output_dir,
                                 "probe_weights",
                                 vector_name,
+                                f"run_{run_id}",
                                 f"hook_{hook_point}",
                                 f"steer_{steer_layer}",
                                 f"alpha_{alpha_to_slug(alpha)}",
@@ -493,7 +598,6 @@ def main() -> None:
                                 weight_path,
                             )
 
-                            stats["weight_path"] = weight_path
                             alpha_results[alpha_key][str(layer_idx)] = stats
 
                     results[str(steer_layer)] = {
@@ -548,72 +652,76 @@ def main() -> None:
                 {},
             )
 
-            save_path = os.path.join(output_dir, f"probe_{vector_name}.json")
+            alpha_values_by_layer_str = {
+                hook_point: {
+                    str(layer_idx): values for layer_idx, values in layer_map.items()
+                }
+                for hook_point, layer_map in alpha_values_by_hook_layer.items()
+            }
+            alpha_values_by_layer_percent_str = {
+                hook_point: {
+                    str(layer_idx): values for layer_idx, values in layer_map.items()
+                }
+                for hook_point, layer_map in alpha_values_by_hook_layer_percent.items()
+            }
+            hook_point_payload = {}
+            for hook_point in hook_points:
+                hook_point_payload[hook_point] = {
+                    "alpha_values": merged_alpha_values_by_hook_point.get(
+                        hook_point, []
+                    ),
+                    "alpha_values_percent": merged_alpha_values_percent_by_hook_point.get(
+                        hook_point, []
+                    ),
+                    "results": merged_results_by_hook_point.get(hook_point, {}),
+                    "results_by_steer_layer": results_by_hook_point.get(hook_point, {}),
+                }
+
+            payload = {
+                "model": model_name_full,
+                "concept": concept_name,
+                "vector": vector_name,
+                "run_id": run_id,
+                "run_timestamp": run_timestamp,
+                "params_hash": params_hash,
+                "steer_layers": steer_layers,
+                "alpha_mode": args.alpha_mode,
+                "hook_points": hook_points,
+                "hook_point": primary_hook_point if len(hook_points) == 1 else None,
+                "alpha_values": primary_merged_alpha_values,
+                "alpha_values_percent": primary_merged_alpha_values_percent,
+                "alpha_values_manual": (
+                    manual_alpha_values if args.alpha_mode == "manual" else None
+                ),
+                "alpha_values_manual_percent": (
+                    [alpha_to_percent(alpha) for alpha in manual_alpha_values]
+                    if args.alpha_mode == "manual"
+                    else None
+                ),
+                "alpha_scales": alpha_scales if args.alpha_mode == "avg_norm" else None,
+                "alpha_values_by_layer": (
+                    alpha_values_by_layer_str if args.alpha_mode == "avg_norm" else None
+                ),
+                "alpha_values_by_layer_percent": (
+                    alpha_values_by_layer_percent_str
+                    if args.alpha_mode == "avg_norm"
+                    else None
+                ),
+                "max_prompts": len(prompts),
+                "probe_layers": steer_layers,
+                "results": primary_merged_results,
+                "results_by_steer_layer": hook_point_payload[primary_hook_point][
+                    "results_by_steer_layer"
+                ],
+                "hooks": hook_point_payload,
+            }
+
+            save_path = os.path.join(
+                output_dir,
+                f"probe_{vector_name}__run_{run_id}.json",
+            )
             with open(save_path, "w") as f:
-                alpha_values_by_layer_str = {
-                    hook_point: {
-                        str(layer_idx): values
-                        for layer_idx, values in layer_map.items()
-                    }
-                    for hook_point, layer_map in alpha_values_by_hook_layer.items()
-                }
-                alpha_values_by_layer_percent_str = {
-                    hook_point: {
-                        str(layer_idx): values
-                        for layer_idx, values in layer_map.items()
-                    }
-                    for hook_point, layer_map in alpha_values_by_hook_layer_percent.items()
-                }
-                json.dump(
-                    {
-                        "model": model_name_full,
-                        "vector": vector_name,
-                        "steer_layers": steer_layers,
-                        "alpha_mode": args.alpha_mode,
-                        "hook_points": hook_points,
-                        "hook_point": (
-                            primary_hook_point if len(hook_points) == 1 else None
-                        ),
-                        "alpha_values": primary_merged_alpha_values,
-                        "alpha_values_percent": primary_merged_alpha_values_percent,
-                        "alpha_values_by_hook_point": merged_alpha_values_by_hook_point,
-                        "alpha_values_percent_by_hook_point": (
-                            merged_alpha_values_percent_by_hook_point
-                        ),
-                        "alpha_values_manual": (
-                            manual_alpha_values if args.alpha_mode == "manual" else None
-                        ),
-                        "alpha_values_manual_percent": (
-                            [alpha_to_percent(alpha) for alpha in manual_alpha_values]
-                            if args.alpha_mode == "manual"
-                            else None
-                        ),
-                        "alpha_scales": (
-                            alpha_scales if args.alpha_mode == "avg_norm" else None
-                        ),
-                        "alpha_values_by_layer": (
-                            alpha_values_by_layer_str
-                            if args.alpha_mode == "avg_norm"
-                            else None
-                        ),
-                        "alpha_values_by_layer_percent": (
-                            alpha_values_by_layer_percent_str
-                            if args.alpha_mode == "avg_norm"
-                            else None
-                        ),
-                        "max_prompts": len(prompts),
-                        "probe_layers": steer_layers,
-                        "results": primary_merged_results,
-                        "results_by_hook_point": merged_results_by_hook_point,
-                        "results_by_steer_layer": results_by_hook_point.get(
-                            primary_hook_point,
-                            {},
-                        ),
-                        "results_by_hook_point_by_steer_layer": results_by_hook_point,
-                    },
-                    f,
-                    indent=2,
-                )
+                json.dump(payload, f, indent=2)
             logger.info(f"Saved results to {save_path}")
 
 
