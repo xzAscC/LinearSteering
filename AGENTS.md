@@ -25,6 +25,7 @@ Common Commands
 
 Repository Layout
 - `src/`: research scripts and utilities
+- `tests/`: pytest suite covering scripts and plotting helpers
 - `assets/`: concept vectors, linearity results, and derived artifacts
 - `dataset/`: prompt datasets (JSONL)
 - `logs/`, `plots/`: outputs from analysis scripts
@@ -105,5 +106,5 @@ Missing Rules
 - If these files are added later, update this document to include their guidance.
 
 Notes
-- README is currently minimal; do not assume additional workflow steps beyond scripts.
-- There is no formal test suite; validate changes by running the relevant scripts.
+- Use `README.md` for high-level project setup and common workflows.
+- There is a pytest suite in `tests/`; run the most relevant tests for touched code.
