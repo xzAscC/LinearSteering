@@ -11,7 +11,6 @@ from loguru import logger
 from tqdm import tqdm
 
 from probe_utils import (
-    alpha_to_percent,
     alpha_to_slug,
     compute_avg_hidden_norm,
     load_prompts_for_concepts,
@@ -374,9 +373,10 @@ def main() -> None:
         alpha_values_by_hook_layer: Dict[str, Dict[int, List[float]]] = {
             hook_point: {} for hook_point in hook_points
         }
-        alpha_values_by_hook_layer_percent: Dict[str, Dict[int, List[float]]] = {
-            hook_point: {} for hook_point in hook_points
-        }
+        alpha_entries_by_hook_layer: Dict[
+            str,
+            Dict[int, List[Tuple[float, float]]],
+        ] = {hook_point: {} for hook_point in hook_points}
         if args.alpha_mode == "avg_norm":
             for hook_point in hook_points:
                 for steer_layer in steer_layers:
@@ -392,22 +392,18 @@ def main() -> None:
                     alpha_values_by_hook_layer[hook_point][steer_layer] = [
                         avg_norm * scale for scale in alpha_scales
                     ]
-                    alpha_values_by_hook_layer_percent[hook_point][steer_layer] = [
-                        alpha_to_percent(alpha)
-                        for alpha in alpha_values_by_hook_layer[hook_point][steer_layer]
-                    ]
+                    alpha_entries_by_hook_layer[hook_point][steer_layer] = list(
+                        zip(
+                            alpha_scales,
+                            alpha_values_by_hook_layer[hook_point][steer_layer],
+                        )
+                    )
                     logger.info(
-                        "Hook {} | Layer {} avg norm={:.4f} -> alphas={}",
+                        "Hook {} | Layer {} avg norm={:.4f} -> alpha scales={}",
                         hook_point,
                         steer_layer,
                         avg_norm,
-                        alpha_values_by_hook_layer[hook_point][steer_layer],
-                    )
-                    logger.info(
-                        "Hook {} | Layer {} alpha%={}",
-                        hook_point,
-                        steer_layer,
-                        alpha_values_by_hook_layer_percent[hook_point][steer_layer],
+                        alpha_scales,
                     )
 
         vector_specs: List[Tuple[str, str, str, List[str]]] = []
@@ -436,17 +432,18 @@ def main() -> None:
             results_by_hook_point = {}
             merged_results_by_hook_point = {}
             merged_alpha_values_by_hook_point = {}
-            merged_alpha_values_percent_by_hook_point = {}
 
             total_probe_evals = 0
             for hook_point in hook_points:
                 for steer_layer in steer_layers:
-                    alpha_values = manual_alpha_values
+                    alpha_entries: List[Tuple[float, float]] = [
+                        (alpha, alpha) for alpha in manual_alpha_values
+                    ]
                     if args.alpha_mode == "avg_norm":
-                        alpha_values = alpha_values_by_hook_layer.get(
+                        alpha_entries = alpha_entries_by_hook_layer.get(
                             hook_point, {}
                         ).get(steer_layer, [])
-                    if not alpha_values:
+                    if not alpha_entries:
                         continue
                     probe_layers = _resolve_layers_to_run(
                         args.probe_layers,
@@ -455,7 +452,7 @@ def main() -> None:
                     )
                     if not probe_layers:
                         continue
-                    total_probe_evals += len(alpha_values) * len(probe_layers)
+                    total_probe_evals += len(alpha_entries) * len(probe_layers)
 
             with tqdm(
                 total=total_probe_evals,
@@ -466,12 +463,14 @@ def main() -> None:
                     results = {}
 
                     for steer_layer in steer_layers:
-                        alpha_values = manual_alpha_values
+                        alpha_entries: List[Tuple[float, float]] = [
+                            (alpha, alpha) for alpha in manual_alpha_values
+                        ]
                         if args.alpha_mode == "avg_norm":
-                            alpha_values = alpha_values_by_hook_layer.get(
+                            alpha_entries = alpha_entries_by_hook_layer.get(
                                 hook_point, {}
                             ).get(steer_layer, [])
-                        if not alpha_values:
+                        if not alpha_entries:
                             continue
                         probe_layers = _resolve_layers_to_run(
                             args.probe_layers,
@@ -488,8 +487,7 @@ def main() -> None:
 
                         alpha_results: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-                        for alpha in alpha_values:
-                            alpha_percent = alpha_to_percent(alpha)
+                        for alpha_key_value, alpha in alpha_entries:
                             layer_features_before: Dict[int, List[torch.Tensor]] = {
                                 layer_idx: [] for layer_idx in probe_layers
                             }
@@ -545,7 +543,7 @@ def main() -> None:
                                     )
                                     layer_features_after[layer_idx].append(token_after)
 
-                            alpha_key = str(alpha)
+                            alpha_key = str(alpha_key_value)
                             alpha_results[alpha_key] = {}
                             for layer_idx in probe_layers:
                                 X_before = torch.cat(
@@ -585,7 +583,7 @@ def main() -> None:
                                     f"run_{run_id}",
                                     f"hook_{hook_point}",
                                     f"steer_{steer_layer}",
-                                    f"alpha_{alpha_to_slug(alpha)}",
+                                    f"alpha_{alpha_to_slug(alpha_key_value if args.alpha_mode == 'avg_norm' else alpha)}",
                                 )
                                 os.makedirs(weight_dir, exist_ok=True)
                                 weight_path = os.path.join(
@@ -599,8 +597,14 @@ def main() -> None:
                                         "std": std,
                                         "raw_weight": raw_weight,
                                         "vector": vector_name,
-                                        "alpha": alpha,
-                                        "alpha_percent": alpha_percent,
+                                        "alpha": alpha
+                                        if args.alpha_mode == "manual"
+                                        else None,
+                                        "alpha_scale": (
+                                            alpha_key_value
+                                            if args.alpha_mode == "avg_norm"
+                                            else None
+                                        ),
                                         "steer_layer": steer_layer,
                                         "layer": layer_idx,
                                         "hook_point": hook_point,
@@ -646,48 +650,36 @@ def main() -> None:
                                 )
 
                     merged_alpha_values = [float(a) for a in merged_alpha_keys_sorted]
-                    merged_alpha_values_percent = [
-                        alpha_to_percent(alpha) for alpha in merged_alpha_values
-                    ]
 
                     results_by_hook_point[hook_point] = results
                     merged_results_by_hook_point[hook_point] = merged_results
                     merged_alpha_values_by_hook_point[hook_point] = merged_alpha_values
-                    merged_alpha_values_percent_by_hook_point[hook_point] = (
-                        merged_alpha_values_percent
-                    )
 
             primary_hook_point = hook_points[0]
             primary_merged_alpha_values = merged_alpha_values_by_hook_point.get(
                 primary_hook_point, []
-            )
-            primary_merged_alpha_values_percent = (
-                merged_alpha_values_percent_by_hook_point.get(primary_hook_point, [])
             )
             primary_merged_results = merged_results_by_hook_point.get(
                 primary_hook_point,
                 {},
             )
 
-            alpha_values_by_layer_str = {
+            alpha_scales_by_layer_str = {
                 hook_point: {
-                    str(layer_idx): values for layer_idx, values in layer_map.items()
+                    str(layer_idx): [
+                        scale
+                        for scale, _alpha in alpha_entries_by_hook_layer.get(
+                            hook_point, {}
+                        ).get(layer_idx, [])
+                    ]
+                    for layer_idx in layer_map
                 }
                 for hook_point, layer_map in alpha_values_by_hook_layer.items()
-            }
-            alpha_values_by_layer_percent_str = {
-                hook_point: {
-                    str(layer_idx): values for layer_idx, values in layer_map.items()
-                }
-                for hook_point, layer_map in alpha_values_by_hook_layer_percent.items()
             }
             hook_point_payload = {}
             for hook_point in hook_points:
                 hook_point_payload[hook_point] = {
                     "alpha_values": merged_alpha_values_by_hook_point.get(
-                        hook_point, []
-                    ),
-                    "alpha_values_percent": merged_alpha_values_percent_by_hook_point.get(
                         hook_point, []
                     ),
                     "results": merged_results_by_hook_point.get(hook_point, {}),
@@ -706,23 +698,12 @@ def main() -> None:
                 "hook_points": hook_points,
                 "hook_point": primary_hook_point if len(hook_points) == 1 else None,
                 "alpha_values": primary_merged_alpha_values,
-                "alpha_values_percent": primary_merged_alpha_values_percent,
                 "alpha_values_manual": (
                     manual_alpha_values if args.alpha_mode == "manual" else None
                 ),
-                "alpha_values_manual_percent": (
-                    [alpha_to_percent(alpha) for alpha in manual_alpha_values]
-                    if args.alpha_mode == "manual"
-                    else None
-                ),
                 "alpha_scales": alpha_scales if args.alpha_mode == "avg_norm" else None,
-                "alpha_values_by_layer": (
-                    alpha_values_by_layer_str if args.alpha_mode == "avg_norm" else None
-                ),
-                "alpha_values_by_layer_percent": (
-                    alpha_values_by_layer_percent_str
-                    if args.alpha_mode == "avg_norm"
-                    else None
+                "alpha_scales_by_layer": (
+                    alpha_scales_by_layer_str if args.alpha_mode == "avg_norm" else None
                 ),
                 "max_prompts": len(prompts),
                 "probe_layers": steer_layers,

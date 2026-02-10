@@ -231,7 +231,7 @@ def _vector_marker(vector_type: str) -> dict[str, object]:
             "point_size": 42,
         }
     return {
-        "linestyle": "--",
+        "linestyle": "-",
         "linewidth": 1.8,
         "alpha": 0.8,
         "point_size": 34,
@@ -240,7 +240,7 @@ def _vector_marker(vector_type: str) -> dict[str, object]:
 
 def _hook_marker(hook_point: str) -> str:
     marker_map = {
-        "input_ln": "x",
+        "input_ln": "X",
         "attn": "*",
         "post_attn_ln": "^",
         "post_attn_proj_ln": "s",
@@ -385,6 +385,7 @@ def plot_one_model(model_name: str, assets_root: str, output_dir: str) -> bool:
     all_hook_points: set[str] = set()
     all_vector_types: set[str] = set()
     plotted_concepts: set[str] = set()
+    random_legend_color = "black"
 
     runs = load_latest_pca_runs(model_dir)
     prepared_runs: list[
@@ -452,7 +453,10 @@ def plot_one_model(model_name: str, assets_root: str, output_dir: str) -> bool:
             continue
 
         color = concept_colors[concept]
-        plotted_concepts.add(concept)
+        if vector_type == "concept":
+            plotted_concepts.add(concept)
+        if vector_type == "random":
+            random_legend_color = color
         marker_style = _vector_marker(vector_type)
         all_vector_types.add(vector_type)
 
@@ -569,25 +573,14 @@ def plot_one_model(model_name: str, assets_root: str, output_dir: str) -> bool:
 
     legend_elements.append(Line2D([0], [0], color="w", label=" ", alpha=0))
 
-    if "concept" in all_vector_types:
-        legend_elements.append(
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linestyle="-",
-                label="Concept Vector",
-                linewidth=2,
-            )
-        )
     if "random" in all_vector_types:
         legend_elements.append(
             Line2D(
                 [0],
                 [0],
-                color="black",
-                linestyle="--",
-                label="Random Vector",
+                color=random_legend_color,
+                linestyle="-",
+                label="Random Direction",
                 linewidth=1.8,
             )
         )
@@ -601,7 +594,8 @@ def plot_one_model(model_name: str, assets_root: str, output_dir: str) -> bool:
                 linestyle="None",
                 marker=_hook_marker(hook_point),
                 label=f"Hook: {_pretty_hook_name(hook_point)}",
-                markersize=8,
+                markersize=9,
+                markeredgewidth=1.5,
             )
         )
 
