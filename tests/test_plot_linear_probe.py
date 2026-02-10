@@ -37,3 +37,34 @@ def test_plot_layer_grid(tmp_path) -> None:
         ncols=1,
     )
     assert output_path.exists()
+
+
+def test_resolve_alpha_axis_uses_scales_for_avg_norm() -> None:
+    alpha_axis = plot_linear_probe._resolve_alpha_axis(
+        ["0.01", "0.1", "1.0"],
+        {
+            "alpha_mode": "avg_norm",
+            "alpha_values": [0.01, 0.1, 1.0],
+            "legacy_alpha_values_percent": [1, 10, 100],
+        },
+    )
+    assert alpha_axis == [0.01, 0.1, 1.0]
+
+
+def test_resolve_alpha_axis_uses_legacy_percent_fallback() -> None:
+    alpha_axis = plot_linear_probe._resolve_alpha_axis(
+        ["12.3", "45.6"],
+        {
+            "alpha_mode": "avg_norm",
+            "alpha_values": [],
+            "legacy_alpha_values_percent": [0.01, 0.1],
+        },
+    )
+    assert alpha_axis == [0.01, 0.1]
+
+
+def test_resolve_alpha_axis_label_avg_norm() -> None:
+    label = plot_linear_probe._resolve_alpha_axis_label(
+        [{"alpha_mode": "avg_norm"}, {"alpha_mode": "avg_norm"}]
+    )
+    assert label == "Alpha scale (x avg norm)"
