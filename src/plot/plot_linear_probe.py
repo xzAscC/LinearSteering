@@ -7,7 +7,8 @@ import math
 import os
 from pathlib import Path
 import sys
-from typing import Dict, List
+from typing import Dict
+from typing import List
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -292,10 +293,11 @@ def _merge_results_by_steer_layer(results_by_steer: Dict) -> Dict[str, Dict]:
             test_bucket = test_sizes.setdefault(str(alpha_key), {})
 
             for layer_key, stats in per_layer.items():
-                if not isinstance(stats, dict) or "test_acc" not in stats:
+                metric_value = _extract_eval_metric(stats)
+                if metric_value is None:
                     continue
                 layer_name = str(layer_key)
-                alpha_bucket.setdefault(layer_name, []).append(float(stats["test_acc"]))
+                alpha_bucket.setdefault(layer_name, []).append(metric_value)
 
                 if "train_size" in stats:
                     train_bucket.setdefault(layer_name, []).append(
@@ -345,12 +347,22 @@ def _sorted_alpha_keys(result_table: Dict) -> List[str]:
     return [key for _value, key in sortable]
 
 
+def _extract_eval_metric(stats: Dict) -> float | None:
+    if not isinstance(stats, dict):
+        return None
+    if "test_acc" in stats:
+        return float(stats["test_acc"])
+    if "test_auc" in stats:
+        return float(stats["test_auc"])
+    return None
+
+
 def _result_table_has_stats(result_table: Dict) -> bool:
     for per_layer in result_table.values():
         if not isinstance(per_layer, dict):
             continue
         for stats in per_layer.values():
-            if isinstance(stats, dict) and "test_acc" in stats:
+            if _extract_eval_metric(stats) is not None:
                 return True
     return False
 
@@ -366,9 +378,164 @@ def _has_plottable_data(item: Dict) -> bool:
         if not isinstance(per_layer, dict):
             continue
         for stats in per_layer.values():
-            if isinstance(stats, dict) and "test_acc" in stats:
+            if _extract_eval_metric(stats) is not None:
                 return True
     return False
+
+
+def _iter_stats_payloads(item: Dict):
+    hooks = item.get("hooks", {})
+    if isinstance(hooks, dict) and hooks:
+        for hook_payload in hooks.values():
+            if not isinstance(hook_payload, dict):
+                continue
+            by_steer = hook_payload.get("results_by_steer_layer", {})
+            if isinstance(by_steer, dict):
+                for steer_payload in by_steer.values():
+                    if not isinstance(steer_payload, dict):
+                        continue
+                    alpha_results = steer_payload.get("alpha_results", {})
+                    if not isinstance(alpha_results, dict):
+                        continue
+                    for per_probe in alpha_results.values():
+                        if not isinstance(per_probe, dict):
+                            continue
+                        for stats in per_probe.values():
+                            if isinstance(stats, dict):
+                                yield stats
+
+            hook_results = hook_payload.get("results", {})
+            if isinstance(hook_results, dict):
+                for per_probe in hook_results.values():
+                    if not isinstance(per_probe, dict):
+                        continue
+                    for stats in per_probe.values():
+                        if isinstance(stats, dict):
+                            yield stats
+
+    top_by_steer = item.get("results_by_steer_layer", {})
+    if isinstance(top_by_steer, dict):
+        for steer_payload in top_by_steer.values():
+            if not isinstance(steer_payload, dict):
+                continue
+            alpha_results = steer_payload.get("alpha_results", {})
+            if not isinstance(alpha_results, dict):
+                continue
+            for per_probe in alpha_results.values():
+                if not isinstance(per_probe, dict):
+                    continue
+                for stats in per_probe.values():
+                    if isinstance(stats, dict):
+                        yield stats
+
+
+def _average_curve(curves: List[List[float]]) -> List[float]:
+    if not curves:
+        return []
+    max_len = max(len(curve) for curve in curves)
+    sums = [0.0] * max_len
+    counts = [0] * max_len
+    for curve in curves:
+        for idx, value in enumerate(curve):
+            sums[idx] += float(value)
+            counts[idx] += 1
+    return [
+        (sums[idx] / counts[idx]) if counts[idx] > 0 else float("nan")
+        for idx in range(max_len)
+    ]
+
+
+def plot_training_curves(results: List[Dict], title: str, output_path: str) -> None:
+    if not results:
+        logger.warning(f"No results to plot training curves for {title}")
+        return
+
+    concepts = [
+        str(item.get("concept", item.get("vector", "unknown"))) for item in results
+    ]
+    concept_renames = build_concept_renames(
+        concepts,
+        strip_prefix="steering_",
+        title_case=True,
+        replacements={
+            "Change Case:": "Case:",
+            "Detectable Format:": "Format:",
+        },
+    )
+    plot_config = build_plot_config(
+        {
+            "style": "seaborn-v0_8-paper",
+            "figsize": (9.0, 5.2),
+            "rc_params": {
+                "font.size": 12,
+                "axes.titlesize": 12,
+                "axes.labelsize": 11,
+                "xtick.labelsize": 10,
+                "ytick.labelsize": 10,
+                "legend.fontsize": 10,
+            },
+        }
+    )
+    apply_plot_style(plot_config["style"], plot_config["rc_params"])
+    concept_colors = build_concept_colors(
+        concepts,
+        palette=plot_config["palette"],
+        use_cycle=plot_config["use_cycle"],
+    )
+
+    fig, ax = plt.subplots(figsize=plot_config["figsize"])
+    has_data = False
+
+    for idx, item in enumerate(results):
+        vector_name = str(item.get("vector", f"vector_{idx}"))
+        concept_name = str(item.get("concept", vector_name))
+        concept_label = concept_renames.get(concept_name, vector_name)
+        color = concept_colors.get(
+            concept_name,
+            plt.cm.tab20(idx % plt.cm.tab20.N),
+        )
+
+        curves: List[List[float]] = []
+        for stats in _iter_stats_payloads(item):
+            curve = stats.get("train_loss_curve")
+            if not isinstance(curve, list) or not curve:
+                continue
+            curves.append([float(v) for v in curve])
+
+        if not curves:
+            continue
+
+        mean_curve = _average_curve(curves)
+        if not mean_curve:
+            continue
+
+        epochs = list(range(1, len(mean_curve) + 1))
+        ax.plot(
+            epochs,
+            mean_curve,
+            label=concept_label,
+            color=color,
+            linewidth=1.6,
+            alpha=0.9,
+        )
+        has_data = True
+
+    if not has_data:
+        logger.warning(f"No train_loss_curve found for {title}")
+        plt.close(fig)
+        return
+
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Training loss (BCE)")
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.legend(loc="best", frameon=False)
+    fig.tight_layout()
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
 
 
 def _hook_marker(hook_point: str) -> str:
@@ -754,16 +921,14 @@ def plot_alpha_grid(
 
                     for probe_layer in probe_layers:
                         layer_stats = per_probe.get(str(probe_layer), {})
-                        if (
-                            not isinstance(layer_stats, dict)
-                            or "test_acc" not in layer_stats
-                        ):
+                        metric_value = _extract_eval_metric(layer_stats)
+                        if metric_value is None:
                             continue
                         points.append(
                             (
                                 int(probe_layer),
                                 str(hook_point),
-                                float(layer_stats.get("test_acc", float("nan"))),
+                                float(metric_value),
                             )
                         )
                         observed_hooks_for_line.add(str(hook_point))
@@ -849,7 +1014,7 @@ def plot_alpha_grid(
                 fontweight="bold",
             )
             ax.set_xlabel("Probe Layer (Hook Order Within Layer)")
-            ax.set_ylabel("Probe accuracy")
+            ax.set_ylabel("Probe score (Acc/AUC)")
             probe_ranks = list(range(len(probe_layers)))
             probe_labels = [str(layer_idx) for layer_idx in probe_layers]
             ax.set_xticks(probe_ranks)
@@ -942,6 +1107,14 @@ def main() -> None:
             results,
             title=f"Linear Probe Accuracy by Alpha ({model_name})",
             output_path=os.path.join(output_dir, f"linear_probe_{model_name}.png"),
+        )
+        plot_training_curves(
+            results,
+            title=f"Linear Probe Training Curves ({model_name})",
+            output_path=os.path.join(
+                output_dir,
+                f"linear_probe_training_curve_{model_name}.png",
+            ),
         )
 
 

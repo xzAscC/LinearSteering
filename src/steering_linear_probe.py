@@ -3,7 +3,10 @@ import hashlib
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Tuple
 
 import torch
 import transformers
@@ -69,7 +72,38 @@ def train_eval_linear_probe(
     epochs: int,
     lr: float,
     test_ratio: float,
-) -> Tuple[Dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _binary_auc_from_scores(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
+        y_true_flat = y_true.detach().float().cpu().view(-1)
+        y_score_flat = y_score.detach().float().cpu().view(-1)
+        if y_true_flat.numel() == 0:
+            return 0.5
+
+        pos_mask = y_true_flat >= 0.5
+        pos_count = int(pos_mask.sum().item())
+        neg_count = int((~pos_mask).sum().item())
+        if pos_count == 0 or neg_count == 0:
+            return 0.5
+
+        sorted_indices = torch.argsort(y_score_flat, stable=True)
+        sorted_scores = y_score_flat[sorted_indices]
+
+        _, tie_counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+        tie_cumsum = tie_counts.cumsum(dim=0)
+        tie_starts = tie_cumsum - tie_counts
+        avg_ranks = (tie_starts + 1 + tie_cumsum).to(torch.float64) / 2.0
+        sorted_ranks = torch.repeat_interleave(avg_ranks, tie_counts)
+
+        inverse_indices = torch.empty_like(sorted_indices)
+        inverse_indices[sorted_indices] = torch.arange(sorted_indices.numel())
+        ranks = sorted_ranks[inverse_indices]
+
+        pos_rank_sum = ranks[pos_mask].sum().item()
+        auc = (pos_rank_sum - (pos_count * (pos_count + 1) / 2.0)) / (
+            pos_count * neg_count
+        )
+        return float(auc)
+
     torch.manual_seed(seed)
     n_samples = X.shape[0]
     perm = torch.randperm(n_samples)
@@ -88,10 +122,12 @@ def train_eval_linear_probe(
     model = torch.nn.Linear(X.shape[1], 1)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.BCEWithLogitsLoss()
+    train_loss_curve: List[float] = []
 
     for _ in range(epochs):
         logits = model(X_train).squeeze(-1)
         loss = loss_fn(logits, y_train)
+        train_loss_curve.append(float(loss.detach().item()))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -99,15 +135,14 @@ def train_eval_linear_probe(
     with torch.no_grad():
         test_logits = model(X_test).squeeze(-1)
         test_probs = torch.sigmoid(test_logits)
-        test_preds = (test_probs >= 0.5).float()
-        test_acc = (
-            (test_preds == y_test).float().mean().item() if y_test.numel() > 0 else 0.0
-        )
+        test_auc = _binary_auc_from_scores(y_test, test_probs)
 
     stats = {
-        "test_acc": float(test_acc),
+        "test_auc": float(test_auc),
         "train_size": int(X_train.shape[0]),
         "test_size": int(X_test.shape[0]),
+        "train_loss_curve": train_loss_curve,
+        "final_train_loss": (float(train_loss_curve[-1]) if train_loss_curve else None),
     }
     weight = model.weight.detach().cpu().squeeze(0)
     bias = model.bias.detach().cpu().squeeze(0)
@@ -619,7 +654,7 @@ def main() -> None:
 
                                 alpha_results[alpha_key][str(layer_idx)] = stats
                                 pbar.set_postfix_str(
-                                    f"test_acc={stats['test_acc']:.4f}"
+                                    f"test_auc={stats['test_auc']:.4f}"
                                 )
                                 pbar.update(1)
 
