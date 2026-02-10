@@ -534,8 +534,12 @@ def main() -> None:
                                 for layer_idx in probe_layers:
                                     h_before = captured_before[layer_idx]
                                     h_after = captured_after[layer_idx]
-                                    z_before = h_before - h_before_steer
-                                    z_after = h_after - h_after_steer
+                                    if hook_point == "block_out":
+                                        z_before = h_before - h_before_steer
+                                        z_after = h_after - h_after_steer
+                                    else:
+                                        z_before = h_before
+                                        z_after = h_after
                                     token_before = z_before[token_mask].float().cpu()
                                     token_after = z_after[token_mask].float().cpu()
                                     layer_features_before[layer_idx].append(
@@ -656,13 +660,6 @@ def main() -> None:
                     merged_alpha_values_by_hook_point[hook_point] = merged_alpha_values
 
             primary_hook_point = hook_points[0]
-            primary_merged_alpha_values = merged_alpha_values_by_hook_point.get(
-                primary_hook_point, []
-            )
-            primary_merged_results = merged_results_by_hook_point.get(
-                primary_hook_point,
-                {},
-            )
 
             alpha_scales_by_layer_str = {
                 hook_point: {
@@ -697,7 +694,6 @@ def main() -> None:
                 "alpha_mode": args.alpha_mode,
                 "hook_points": hook_points,
                 "hook_point": primary_hook_point if len(hook_points) == 1 else None,
-                "alpha_values": primary_merged_alpha_values,
                 "alpha_values_manual": (
                     manual_alpha_values if args.alpha_mode == "manual" else None
                 ),
@@ -706,11 +702,6 @@ def main() -> None:
                     alpha_scales_by_layer_str if args.alpha_mode == "avg_norm" else None
                 ),
                 "max_prompts": len(prompts),
-                "probe_layers": steer_layers,
-                "results": primary_merged_results,
-                "results_by_steer_layer": hook_point_payload[primary_hook_point][
-                    "results_by_steer_layer"
-                ],
                 "hooks": hook_point_payload,
             }
 
