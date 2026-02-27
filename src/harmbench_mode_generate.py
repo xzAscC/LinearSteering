@@ -58,7 +58,7 @@ def resolve_vector_path(args, model_name: str) -> str | None:
         "assets",
         "concept_vectors",
         model_name,
-        "pku_all_token_*.pt",
+        "pku_all_token_dim_pku_saferlhf_pos_neg_100x2_minimal_prompt.pt",
     )
 
 

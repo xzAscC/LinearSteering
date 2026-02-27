@@ -1,9 +1,12 @@
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
+import numpy as np
 from datasets import load_dataset
 from loguru import logger
 
@@ -54,6 +57,23 @@ def parse_args() -> argparse.Namespace:
         default=Path("dataset/pku_saferlhf_pos_neg_100x2.jsonl"),
         help="Output JSONL path",
     )
+    parser.add_argument(
+        "--plot-umap",
+        action="store_true",
+        help="Save a UMAP scatter plot for sampled records",
+    )
+    parser.add_argument(
+        "--umap-output",
+        type=Path,
+        default=Path("plots/pku_saferlhf_pos_neg_100x2_umap.pdf"),
+        help="UMAP plot output path",
+    )
+    parser.add_argument(
+        "--umap-features",
+        type=int,
+        default=2048,
+        help="Hashing feature dimension for text vectors",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +100,82 @@ def _record_from_row(
         "prompt_source": row.get("prompt_source"),
         "response_source": row.get(source_key),
     }
+
+
+def _stable_hash_token(token: str) -> int:
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def _texts_to_hashed_features(texts: list[str], feature_dim: int) -> np.ndarray:
+    features = np.zeros((len(texts), feature_dim), dtype=np.float32)
+    for row_idx, text in enumerate(texts):
+        tokens = text.lower().split()
+        if not tokens:
+            continue
+        for token in tokens:
+            col = _stable_hash_token(token) % feature_dim
+            features[row_idx, col] += 1.0
+        norm = np.linalg.norm(features[row_idx])
+        if norm > 0.0:
+            features[row_idx] /= norm
+    return features
+
+
+def _plot_umap(
+    records: list[dict[str, Any]], output_path: Path, seed: int, feature_dim: int
+) -> None:
+    if len(records) < 2:
+        logger.warning("Skip UMAP plot: not enough records ({})", len(records))
+        return
+
+    try:
+        import umap
+    except ImportError as exc:
+        raise ImportError(
+            "UMAP plotting requires 'umap-learn'. Install it with: uv add umap-learn"
+        ) from exc
+
+    texts = [f"{record['prompt']}\n{record['response']}" for record in records]
+    labels = [record["label"] for record in records]
+
+    features = _texts_to_hashed_features(texts, feature_dim)
+    n_neighbors = min(15, len(records) - 1)
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=0.1,
+        metric="cosine",
+        random_state=seed,
+    )
+    embedding = reducer.fit_transform(features)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 6))
+
+    label_to_color = {"pos": "#1f77b4", "neg": "#d62728"}
+    for label in ("pos", "neg"):
+        indices = [idx for idx, y in enumerate(labels) if y == label]
+        if not indices:
+            continue
+        points = embedding[indices]
+        plt.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=24,
+            alpha=0.8,
+            c=label_to_color[label],
+            label=label,
+        )
+
+    plt.title("UMAP of PKU-SafeRLHF Sampled Prompt-Response Pairs")
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    logger.info("Saved UMAP plot to {}", output_path)
 
 
 def main() -> None:
@@ -128,6 +224,13 @@ def main() -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     logger.info("Saved {} records to {}", len(sampled_records), args.output)
+    if args.plot_umap:
+        _plot_umap(
+            records=sampled_records,
+            output_path=args.umap_output,
+            seed=args.seed,
+            feature_dim=args.umap_features,
+        )
     logger.info(
         "Config: threshold={} num_per_class={} seed={}",
         args.severity_threshold,
