@@ -208,6 +208,7 @@ __marimo__/
 
 # results files
 assets/
+logs/
 plots/
 # sub github repo
 llm-steer-instruct/

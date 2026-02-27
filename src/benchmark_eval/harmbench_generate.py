@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime
 from datetime import timezone
+from glob import glob
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -113,6 +114,68 @@ def resolve_concept_name(steer_vector: str) -> str:
     if steer_vector.endswith(".pt"):
         return os.path.basename(steer_vector).replace(".pt", "")
     return steer_vector
+
+
+def resolve_vector_path_arg(vector_arg: str, model_name: str) -> str:
+    if vector_arg.endswith(".pt"):
+        return vector_arg
+    return os.path.join(
+        "assets",
+        "concept_vectors",
+        model_name,
+        f"{vector_arg}.pt",
+    )
+
+
+def resolve_latest_dim_100_vector(model_name: str) -> str:
+    pattern = os.path.join(
+        "assets",
+        "concept_vectors",
+        model_name,
+        "pku_pos_neg_center_token_layer*.pt",
+    )
+    candidates = [path for path in glob(pattern) if os.path.isfile(path)]
+    if not candidates:
+        raise FileNotFoundError(
+            "No 100-token difference-in-means vector found. "
+            "Expected a file matching "
+            f"'{pattern}'. "
+            "Generate one with src/pku_center_token_concept.py first."
+        )
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates[0]
+
+
+def resolve_steering_mode_vector_path(
+    steering_mode: str,
+    model_name: str,
+    steer_vector: str,
+    dim_100_vector: Optional[str],
+    dim_all_vector: Optional[str],
+    steering_required: bool,
+) -> Optional[str]:
+    if steering_mode == "no_steering" and not steering_required:
+        return None
+
+    if steering_mode == "dim_100_tokens":
+        vector_source = dim_100_vector or resolve_latest_dim_100_vector(model_name)
+    elif steering_mode == "dim_all_tokens":
+        vector_source = dim_all_vector or steer_vector
+    else:
+        vector_source = dim_all_vector or steer_vector
+
+    return resolve_vector_path_arg(vector_source, model_name)
+
+
+def resolve_run_mode(
+    steering_mode: str,
+    run_mode_override: Optional[str],
+) -> str:
+    if run_mode_override is not None:
+        return run_mode_override
+    if steering_mode == "no_steering":
+        return "unsteering"
+    return "steering"
 
 
 def _to_unit_vector(vector: torch.Tensor, error_message: str) -> torch.Tensor:
@@ -317,6 +380,35 @@ def main() -> None:
         "--steer_vector",
         type=str,
         default="steering_safety",
+        help="Difference-in-means vector name/path used by dim_all_tokens mode",
+    )
+    parser.add_argument(
+        "--steering_mode",
+        type=str,
+        default="no_steering",
+        choices=["no_steering", "dim_100_tokens", "dim_all_tokens"],
+        help=(
+            "Generation mode: no steering, steering with 100-token "
+            "difference-in-means, or steering with all-token difference-in-means"
+        ),
+    )
+    parser.add_argument(
+        "--dim_100_vector",
+        type=str,
+        default=None,
+        help=(
+            "Optional vector path/name for dim_100_tokens mode. "
+            "Defaults to latest pku_pos_neg_center_token_layer*.pt"
+        ),
+    )
+    parser.add_argument(
+        "--dim_all_vector",
+        type=str,
+        default=None,
+        help=(
+            "Optional vector path/name for dim_all_tokens mode. "
+            "Defaults to --steer_vector"
+        ),
     )
     parser.add_argument("--steer_layer", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=10.0)
@@ -331,9 +423,12 @@ def main() -> None:
     parser.add_argument(
         "--run_mode",
         type=str,
-        default="unsteering",
+        default=None,
         choices=["steering", "unsteering"],
-        help="Run only steering or unsteering generation",
+        help=(
+            "Legacy override for generation behavior. "
+            "If omitted, mode is inferred from --steering_mode"
+        ),
     )
     parser.add_argument(
         "--remove_at_final_norm",
@@ -362,10 +457,23 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     model_name = get_model_name_for_path(args.model)
-    steer_layer = resolve_steer_layer(args.model, args.steer_layer)
+    run_mode = resolve_run_mode(args.steering_mode, args.run_mode)
+    steering_required = run_mode == "steering"
+
+    if args.steering_mode == "no_steering" and steering_required:
+        logger.warning(
+            "steering_mode=no_steering with run_mode=steering: falling back to dim_all_tokens vector"
+        )
+
+    steer_layer = None
+    if steering_required:
+        steer_layer = resolve_steer_layer(args.model, args.steer_layer)
+
     final_norm_layer = None
     final_norm_alpha_layer = None
     if args.remove_at_final_norm:
+        if not steering_required:
+            raise ValueError("--remove_at_final_norm requires steering mode")
         final_norm_layer = resolve_final_norm_layer(args.model, args.final_norm_layer)
         if final_norm_layer is None:
             final_norm_layer = MODEL_LAYERS[args.model] - 1
@@ -373,24 +481,39 @@ def main() -> None:
             args.model, args.final_norm_alpha_layer
         )
 
-    vector_path = args.steer_vector
-    if not vector_path.endswith(".pt"):
-        vector_path = os.path.join(
-            "assets",
-            "concept_vectors",
-            model_name,
-            f"{args.steer_vector}.pt",
-        )
+    vector_mode = args.steering_mode
+    if vector_mode == "no_steering" and steering_required:
+        vector_mode = "dim_all_tokens"
 
-    steering_tensor = load_vector(vector_path)
-    if steering_tensor.ndim == 2:
-        steering_vector = steering_tensor[steer_layer]
-    else:
-        steering_vector = steering_tensor
+    vector_path = resolve_steering_mode_vector_path(
+        steering_mode=vector_mode,
+        model_name=model_name,
+        steer_vector=args.steer_vector,
+        dim_100_vector=args.dim_100_vector,
+        dim_all_vector=args.dim_all_vector,
+        steering_required=steering_required,
+    )
+
+    steering_tensor = None
+    steering_vector = None
+    if vector_path is not None:
+        steering_tensor = load_vector(vector_path)
+        if steering_tensor.ndim == 2:
+            if steer_layer is None:
+                raise ValueError(
+                    "steer_layer is required for layer-wise steering vectors"
+                )
+            steering_vector = steering_tensor[steer_layer]
+        else:
+            steering_vector = steering_tensor
 
     final_norm_vector = None
     final_norm_alpha_vector = None
     if args.remove_at_final_norm:
+        if steering_tensor is None:
+            raise ValueError(
+                "Steering vector is required when --remove_at_final_norm is set"
+            )
         if steering_tensor.ndim == 2:
             final_norm_vector = steering_tensor[final_norm_layer]
             if final_norm_alpha_layer is not None:
@@ -399,7 +522,11 @@ def main() -> None:
             final_norm_vector = steering_tensor
             final_norm_alpha_vector = steering_tensor
 
-    steering_unit = _to_unit_vector(steering_vector, "Steering vector has zero norm")
+    steering_unit = None
+    if steering_vector is not None:
+        steering_unit = _to_unit_vector(
+            steering_vector, "Steering vector has zero norm"
+        )
 
     final_norm_unit = None
     if final_norm_vector is not None:
@@ -418,6 +545,8 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     logger.info("Device: {}", device)
+    logger.info("Steering mode: {}", args.steering_mode)
+    logger.info("Run mode: {}", run_mode)
     logger.info("Steer layer: {}", steer_layer)
     logger.info("Steer vector: {}", vector_path)
     logger.info("Alpha mode: {}", args.alpha_mode)
@@ -442,7 +571,9 @@ def main() -> None:
     alpha_zbar_final_norm = None
     steering_vector_for_generation = steering_vector
     final_norm_vector_for_generation = final_norm_vector
-    if args.alpha_mode == "auto":
+    if steering_required and args.alpha_mode == "auto":
+        if steering_unit is None or steer_layer is None:
+            raise ValueError("Auto alpha requires steering vector and steer layer")
         concept_name = resolve_concept_name(args.steer_vector)
         concept_config = CONCEPT_CATEGORIES.get(concept_name)
         if concept_config is None:
@@ -484,24 +615,43 @@ def main() -> None:
                 )
             logger.info("Final norm alpha zbar: {:.6f}", alpha_zbar_final_norm)
             final_norm_vector_for_generation = final_norm_unit
-    else:
+    elif steering_required:
         logger.info("Alpha: {}", args.alpha)
 
     dataset = load_dataset_split(args.dataset, args.dataset_config, args.split)
     items = sample_prompts(dataset, args.sample_size, args.seed)
 
-    steer_name = resolve_concept_name(args.steer_vector)
-    run_tag = "unsteering_safety" if args.run_mode == "unsteering" else "steering"
+    if vector_path is None:
+        steer_name = "none"
+    else:
+        steer_name = resolve_concept_name(vector_path)
+
+    if run_mode == "unsteering":
+        run_tag = f"{args.steering_mode}_unsteering"
+    else:
+        run_tag = f"{args.steering_mode}_steering"
+
     if args.remove_at_final_norm:
         run_tag = f"{run_tag}_finalnorm_remove"
-    run_dir = os.path.join(
-        args.output_dir,
-        model_name,
-        str(steer_layer),
-        steer_name,
-        args.alpha_mode,
-        run_tag,
-    )
+
+    if steer_layer is None:
+        run_dir = os.path.join(
+            args.output_dir,
+            model_name,
+            "no_layer",
+            steer_name,
+            args.alpha_mode,
+            run_tag,
+        )
+    else:
+        run_dir = os.path.join(
+            args.output_dir,
+            model_name,
+            str(steer_layer),
+            steer_name,
+            args.alpha_mode,
+            run_tag,
+        )
     samples_dir = os.path.join(run_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
     with open(os.path.join(run_dir, "steer_layer.txt"), "w") as f:
@@ -513,7 +663,9 @@ def main() -> None:
     for idx, item in enumerate(items):
         prompt = extract_prompt(item)
         alpha_value = args.alpha
-        if args.alpha_mode == "auto":
+        if steering_required and args.alpha_mode == "auto":
+            if steering_unit is None or steer_layer is None:
+                raise ValueError("Auto alpha requires steering vector and steer layer")
             alpha_value = (alpha_zbar or 0.0) - compute_projection_for_prompt(
                 model,
                 tokenizer,
@@ -524,7 +676,9 @@ def main() -> None:
             )
         final_norm_alpha_value = None
         if (
-            args.remove_at_final_norm
+            steering_required
+            and steering_unit is not None
+            and args.remove_at_final_norm
             and final_norm_layer is not None
             and final_norm_alpha_layer is not None
         ):
@@ -544,7 +698,8 @@ def main() -> None:
                     )
             else:
                 final_norm_alpha_value = args.alpha
-        alpha_values.append(alpha_value)
+        if steering_required:
+            alpha_values.append(alpha_value)
         if final_norm_alpha_value is not None:
             final_norm_alpha_values.append(final_norm_alpha_value)
         logger.info("Running sample {} (alpha={:.6f})", idx, alpha_value)
@@ -557,7 +712,7 @@ def main() -> None:
         if final_norm_alpha_value is not None:
             record["final_norm_alpha"] = final_norm_alpha_value
 
-        if args.run_mode == "unsteering":
+        if run_mode == "unsteering":
             unsteered = generate_text(
                 model,
                 tokenizer,
@@ -577,6 +732,10 @@ def main() -> None:
                 }
             )
         else:
+            if steering_vector_for_generation is None or steer_layer is None:
+                raise ValueError(
+                    "Steering mode requires steering vector and steer layer"
+                )
             steered = generate_text(
                 model,
                 tokenizer,
@@ -619,6 +778,7 @@ def main() -> None:
         "split": args.split,
         "sample_size": len(records),
         "seed": args.seed,
+        "steering_mode": args.steering_mode,
         "steer_vector": vector_path,
         "steer_layer": steer_layer,
         "alpha_mode": args.alpha_mode,
@@ -639,7 +799,7 @@ def main() -> None:
             "temperature": args.temperature,
             "top_p": args.top_p,
         },
-        "run_mode": args.run_mode,
+        "run_mode": run_mode,
         "run_tag": run_tag,
         "unsteered_avg_length": unsteered_avg_len,
         "steered_avg_length": steered_avg_len,
@@ -655,7 +815,7 @@ def main() -> None:
     generation_path = os.path.join(generation_dir, "generation.json")
     with open(generation_path, "w") as f:
         json.dump(summary, f, indent=2)
-    if args.run_mode == "steering" and is_last_layer:
+    if run_mode == "steering" and is_last_layer:
         prefixed_path = os.path.join(generation_dir, "last_layer_generation.json")
         with open(prefixed_path, "w") as f:
             json.dump(summary, f, indent=2)
