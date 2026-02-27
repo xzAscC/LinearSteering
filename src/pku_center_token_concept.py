@@ -128,6 +128,38 @@ def select_global_topk_token_refs(
     return selected_refs, selected_distances
 
 
+def build_topk_token_literal_records(
+    model: transformer_lens.HookedTransformer,
+    texts: list[str],
+    token_refs: list[tuple[int, int]],
+    token_distances: list[float],
+) -> list[dict[str, Any]]:
+    token_literals_by_sample: dict[int, list[str]] = {}
+    records: list[dict[str, Any]] = []
+
+    for idx, (sample_idx, token_idx) in enumerate(token_refs):
+        if sample_idx not in token_literals_by_sample:
+            token_literals_by_sample[sample_idx] = model.to_str_tokens(
+                texts[sample_idx]
+            )
+
+        sample_tokens = token_literals_by_sample[sample_idx]
+        token_literal = ""
+        if 0 <= token_idx < len(sample_tokens):
+            token_literal = sample_tokens[token_idx]
+
+        records.append(
+            {
+                "sample_index": sample_idx,
+                "token_index": token_idx,
+                "token_literal": token_literal,
+                "distance_to_center": token_distances[idx],
+            }
+        )
+
+    return records
+
+
 def compute_concept_vectors_from_selected_tokens(
     model: transformer_lens.HookedTransformer,
     pos_texts: list[str],
@@ -326,6 +358,19 @@ def main() -> None:
         top_k=args.num_closest_tokens,
     )
 
+    pos_topk_literals = build_topk_token_literal_records(
+        model=model,
+        texts=pos_texts,
+        token_refs=pos_token_refs_topk,
+        token_distances=pos_topk_distances,
+    )
+    neg_topk_literals = build_topk_token_literal_records(
+        model=model,
+        texts=neg_texts,
+        token_refs=neg_token_refs_topk,
+        token_distances=neg_topk_distances,
+    )
+
     concept_vectors = compute_concept_vectors_from_selected_tokens(
         model=model,
         pos_texts=pos_texts,
@@ -381,6 +426,10 @@ def main() -> None:
         "selected_topk_token_distance_to_center": {
             "safety": pos_topk_distances,
             "unsafety": neg_topk_distances,
+        },
+        "selected_topk_token_literal": {
+            "safety": pos_topk_literals,
+            "unsafety": neg_topk_literals,
         },
         "output_path": str(concept_path),
     }
